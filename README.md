@@ -127,7 +127,7 @@ If a game numbers its versions differently, its matching file would be reported 
 |---|---|---|
 | Grand Theft Auto IV | 0, 8 | Skip Legal Screens, Disable blur filter, Unlock FPS |
 | Grand Theft Auto V | 27 | FPS Uncap, Skip Intro Logos (see above) |
-| Gears of War | 5 | 60 FPS, Show Frametime; with Disable Motion Blur + these two the campaign didn't start (being narrowed down) |
+| Gears of War | 5 | 60 FPS, Show Frametime; with Disable Motion Blur |
 | Gears of War 3 | 6 | Unlock FPS, Show FPS, Disable Motion Blur / Depth of Field / Bloom |
 | Forza Horizon | 4 | Disable Motion Blur / Depth of Field / Shadows |
 | Bionicle Heroes | 0 | 60 FPS |
