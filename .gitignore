@@ -1,0 +1,13 @@
+# build output
+*.obj
+*.dll
+*.pe
+*.xdb
+*.xex
+*.exp
+*.lib
+*.pdb
+*.ilk
+# converted patches stay out of the repo
+Patches_xbox*/
+patches/
