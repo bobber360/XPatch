@@ -83,11 +83,26 @@ static void Log(const char* fmt, ...)
 static void MountHdd()
 {
     XP_STRING link, dev;
-    // For system threads the "\System??\" namespace is used; if this fails on
-    // your setup try "\??\Hdd:".
+    RtlInitAnsiString(&dev, "\\Device\\Harddisk0\\Partition1");
+    // Create "Hdd:" in both namespaces: system threads use "\System??\",
+    // the rest "\??\". Don't rely on another plugin (JRPC etc.) having done it.
     RtlInitAnsiString(&link, "\\System??\\Hdd:");
-    RtlInitAnsiString(&dev,  "\\Device\\Harddisk0\\Partition1");
     ObCreateSymbolicLink(&link, &dev);
+    RtlInitAnsiString(&link, "\\??\\Hdd:");
+    ObCreateSymbolicLink(&link, &dev);
+}
+
+// Plugins load very early at boot; the hard disk may not be ready yet.
+// Retry until Hdd:\Patches can be created or opened (up to ~60 s).
+static BOOL WaitForHdd()
+{
+    for (int i = 0; i < 120; i++) {
+        MountHdd();
+        if (CreateDirectory("Hdd:\\Patches", NULL) || GetLastError() == ERROR_ALREADY_EXISTS)
+            return TRUE;
+        Sleep(500);
+    }
+    return FALSE;
 }
 
 // --------------------------------------------------------------------------
@@ -438,19 +453,50 @@ extern "C" {
 typedef VOID (*XNOTIFYQUEUEUICUSTOM)(DWORD Type, DWORD UserIndex, ULONGLONG Priority,
                                      LPCWSTR Text, ULONGLONG Param);
 
-static void Notify(const char* text)
+static XNOTIFYQUEUEUICUSTOM GetNotifyFn()
 {
     static XNOTIFYQUEUEUICUSTOM fn = NULL;
     if (!fn) {
         HANDLE xam = NULL;
-        if (XexGetModuleHandle("xam.xex", &xam) != 0 || !xam) return;
-        if (XexGetProcedureAddress(xam, 656, (PVOID*)&fn) != 0) { fn = NULL; return; }
+        DWORD st = XexGetModuleHandle("xam.xex", &xam);
+        if (st != 0 || !xam) { Log("Notify: xam.xex handle failed (%08X)", st); return NULL; }
+        st = XexGetProcedureAddress(xam, 656, (PVOID*)&fn);
+        if (st != 0 || !fn) { Log("Notify: ordinal 656 not found (%08X)", st); fn = NULL; return NULL; }
+        Log("Notify: XNotifyQueueUICustom at %08X", (DWORD)fn);
     }
-    static WCHAR wtext[128];
+    return fn;
+}
+
+static void ToWide(const char* text, WCHAR* out, int max)
+{
     int i = 0;
-    for (; text[i] && i < 127; i++) wtext[i] = (WCHAR)(BYTE)text[i];
-    wtext[i] = 0;
-    fn(14, 0xFF, 2, wtext, 0);   // 14 = generic/preferred-review icon, 0xFF = all users
+    for (; text[i] && i < max - 1; i++) out[i] = (WCHAR)(BYTE)text[i];
+    out[i] = 0;
+}
+
+// XAM only shows the toast when it is queued from a thread of the running
+// title, not from a system thread like ours (tested on the console without
+// JRPC2: system thread -> nothing, title thread -> toast). So every
+// notification is sent from a short-lived thread created in the title.
+static WCHAR g_NotifyText[128];
+
+static void __cdecl NotifyThread(void*)
+{
+    XNOTIFYQUEUEUICUSTOM fn = GetNotifyFn();
+    if (fn) fn(14, 0, 2, g_NotifyText, 0);   // 14 = smiley icon, user 0, priority 2
+}
+
+static void Notify(const char* text)
+{
+    if (!GetNotifyFn()) return;
+    ToWide(text, g_NotifyText, 128);
+    HANDLE h = NULL; DWORD tid = 0;
+    // no 0x2 flag: not a system thread, so it belongs to the running title
+    ExCreateThread(&h, 0, &tid, (PVOID)XapiThreadStartup,
+                   (LPTHREAD_START_ROUTINE)NotifyThread, NULL, CREATE_SUSPENDED);
+    if (!h) { Log("Notify: could not create thread"); return; }
+    ResumeThread(h);
+    CloseHandle(h);
 }
 
 static void ApplyPatches(const XP_EXEC_ID* exec)
@@ -509,8 +555,7 @@ static void ApplyPatches(const XP_EXEC_ID* exec)
 // --------------------------------------------------------------------------
 static void __cdecl MainThread(void*)
 {
-    MountHdd();
-    CreateDirectory("Hdd:\\Patches", NULL);
+    if (!WaitForHdd()) return;   // no hard disk -> nothing to patch from
     Log("XPatch started");
 
     DWORD lastTitle = 0;
