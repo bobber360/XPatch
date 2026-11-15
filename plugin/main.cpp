@@ -1,24 +1,37 @@
-// XPatch - runtime game patcher Dashlaunch plugin (Xbox 360 RGH/JTAG)
+// XPatch360 v1.1
+// Runtime game patcher Dashlaunch plugin (Xbox 360 RGH/JTAG)
 // Authors: bobber360 & Claude
 //
 // Reads Xenia Canary patch files directly from the console:
 //   Hdd:\Patches\<TITLEID> - <Game>.patch.toml
-// When a title starts (TU already applied by the loader), it applies every
-// [[patch]] with is_enabled = true. Toggle them with the Aurora script
-// (Utilities -> XPatch) or by editing the TOML.
+// When a title starts (TU already applied by the loader), it computes the same
+// module hash as Xenia Canary and applies every [[patch]] with
+// is_enabled = true, but only from files whose "hash" matches the running game. Toggle them with the Aurora script
+// (Utilities -> XPatch360) or by editing the TOML.
 //
-// Build: XDK, "Xbox 360 DLL" project -> output .xex
-// Load:  launch.ini ->  plugin1 = Hdd:\XPatch.xex   (any path works)
-// Log:   Hdd:\Patches\XPatch.log
+// Build: build.bat (Xbox 360 SDK) -> XPatch360.xex
+// Load:  launch.ini ->  pluginN = Hdd:\XPatch360.xex
+// Log:   Hdd:\Patches\XPatch360.log
 //
-// NOTE: not compiled/tested in this form. Kernel/XAM prototypes follow the
-// usual scene declarations; if your headers (e.g. xkelib) already declare
-// them, delete the duplicates.
+// Uses xxHash (BSD 2-Clause, https://github.com/Cyan4973/xxHash) for the
+// XXH3-64 module hash that Xenia Canary writes into the "hash" field.
+
+#define XPATCH_VERSION "1.1"
 
 #include <xtl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+// The Xbox 360 compiler defines _WIN32, and xxhash takes _WIN32 to mean a
+// little-endian CPU. The Xenon is big endian: say so, or every hash is wrong.
+#if defined(_XBOX)
+#  define XXH_CPU_LITTLE_ENDIAN 0
+#endif
+#define XXH_INLINE_ALL
+#define XXH_NO_INLINE_HINTS 1 // smaller code and stack frames
+#define XXH_VECTOR 0          // XXH_SCALAR: portable code, same result on big endian
+#include "xxhash.h"
 
 // --------------------------------------------------------------------------
 // Kernel / XAM imports
@@ -33,6 +46,8 @@ extern "C" {
     VOID  RtlInitAnsiString(PXP_STRING Dest, const char* Src);
     LONG  ObCreateSymbolicLink(PXP_STRING Link, PXP_STRING Device);
     BOOL  MmIsAddressValid(PVOID Address);
+    DWORD XexGetModuleHandle(PCSTR ModuleName, PHANDLE Handle);
+    DWORD XexGetProcedureAddress(HANDLE Module, DWORD Ordinal, PVOID* Address);
     DWORD XamGetCurrentTitleId(VOID);
     DWORD XamGetExecutionId(PVOID* ExecutionId);
 
@@ -57,7 +72,7 @@ typedef struct _XP_EXEC_ID {
 #pragma pack(pop)
 
 #define XP_DIR       "Hdd:\\Patches\\"
-#define XP_LOG       XP_DIR "XPatch.log"
+#define XP_LOG       XP_DIR "XPatch360.log"
 #define XP_MAX_FILE  (512 * 1024)
 
 static BOOL g_Running = TRUE;
@@ -66,6 +81,23 @@ static char g_FileBuf[XP_MAX_FILE + 1];
 // --------------------------------------------------------------------------
 // Logging
 // --------------------------------------------------------------------------
+// While a game is being patched every hard-disk write costs time the game is
+// already running, so log lines are collected in memory and written in one go
+// afterwards (LogDefer / LogFlush).
+static BOOL  g_LogDefer = FALSE;
+static char  g_LogBuf[8192];
+static DWORD g_LogLen = 0;
+
+static void LogFlush()
+{
+    if (g_LogLen) {
+        FILE* f = fopen(XP_LOG, "a");
+        if (f) { fwrite(g_LogBuf, 1, g_LogLen, f); fclose(f); }
+        g_LogLen = 0;
+    }
+    g_LogDefer = FALSE;
+}
+
 static void Log(const char* fmt, ...)
 {
     char line[512];
@@ -76,6 +108,15 @@ static void Log(const char* fmt, ...)
     line[sizeof(line) - 3] = 0;
     strcat(line, "\r\n");
 
+    if (g_LogDefer) {
+        DWORD n = (DWORD)strlen(line);
+        if (g_LogLen + n < sizeof(g_LogBuf)) {
+            memcpy(g_LogBuf + g_LogLen, line, n);
+            g_LogLen += n;
+            return;
+        }
+        LogFlush();                       // buffer full: write it out
+    }
     FILE* f = fopen(XP_LOG, "a");
     if (f) { fputs(line, f); fclose(f); }
 }
@@ -131,6 +172,320 @@ static void FlushRange(BYTE* p, DWORD len)
     for (DWORD a = start; a < end; a += 128)
         Icbi((void*)a);
     Isync();
+}
+
+// --------------------------------------------------------------------------
+// Module hash, the way Xenia Canary computes the "hash" field
+// (src/xenia/kernel/user_module.cc, UserModule::CalculateHash):
+//   - take the XEX security info of the running executable (after the TU),
+//   - find the first and the last page descriptor marked as CODE,
+//   - Xenia uses the descriptor INDEX as a page number (index * page size),
+//     this is copied exactly so the result matches,
+//   - XXH3-64 over [base + first*page, base + (last+1)*page).
+// Xenia hashes AFTER it has resolved the imports in its own way
+// (src/xenia/cpu/xex_module.cc, SetupLibraryImports):
+//   - kernel/xam function thunks (16 bytes) -> sc 2; blr; nop; nop
+//   - function import descriptors (4 bytes) -> 0xDEADC0DE
+//   - variable imports -> Xenia's own addresses (cannot be reproduced)
+// The console writes different values there, so the import table of the XEX
+// is read and those places are replaced with Xenia's bytes while hashing
+// (memory itself is not changed).
+// --------------------------------------------------------------------------
+#define XEX_SECTION_CODE            1
+#define XEX_HEADER_IMPORT_LIBRARIES 0x000103FF
+#define XEX_IMAGE_PAGE_SIZE_4KB     0x10000000
+
+typedef struct {
+    BOOL   Ok;
+    DWORD  Start, End, PageSize, Descriptors, FirstCode, LastCode;
+    DWORD  Thunks, FuncSlots;      // replaced with Xenia's bytes (inside the range)
+    DWORD  VarSlots, UserThunks;   // inside the range but NOT reproducible
+    UINT64 Raw, XeniaStyle;
+} XP_HASH;
+
+// Places to replace while hashing (address, length, bytes to use instead).
+// Kept small on purpose: system plugins share a small memory pool with xbdm.
+typedef struct { DWORD Addr; DWORD Len; const BYTE* Data; } XP_SUBST;
+#define XP_MAX_SUBST 2048
+static XP_SUBST g_Subst[XP_MAX_SUBST];
+static int      g_SubstCount;
+
+static const BYTE g_XThunk[16] = { 0x44,0x00,0x00,0x42, 0x4E,0x80,0x00,0x20,
+                                   0x60,0x00,0x00,0x00, 0x60,0x00,0x00,0x00 };
+static const BYTE g_XFunc[4]   = { 0xDE,0xAD,0xC0,0xDE };
+
+// big-endian 32-bit read (the console is big endian; explicit so it is portable)
+static DWORD Be32(const BYTE* p)
+{
+    return ((DWORD)p[0] << 24) | ((DWORD)p[1] << 16) | ((DWORD)p[2] << 8) | (DWORD)p[3];
+}
+
+static void AddSubst(DWORD addr, const BYTE* data, DWORD len)
+{
+    if (g_SubstCount >= XP_MAX_SUBST) return;
+    g_Subst[g_SubstCount].Addr = addr;
+    g_Subst[g_SubstCount].Len  = len;
+    g_Subst[g_SubstCount].Data = data;
+    g_SubstCount++;
+}
+
+// ---- undo log: original bytes of everything XPatch360 writes ----
+// Used to check a cached hash after patching (hash the memory as it was) and
+// to undo the writes if that check fails.
+typedef struct { DWORD Addr; DWORD Len; DWORD Off; } XP_UNDO;
+#define XP_MAX_UNDO 512
+static XP_UNDO g_Undo[XP_MAX_UNDO];
+static int     g_UndoCount;
+static BYTE    g_UndoData[16384];
+static DWORD   g_UndoUsed;
+static BOOL    g_UndoFull;
+
+static void UndoReset() { g_UndoCount = 0; g_UndoUsed = 0; g_UndoFull = FALSE; }
+
+static void UndoSave(const BYTE* addr, DWORD len)
+{
+    if (g_UndoCount >= XP_MAX_UNDO || g_UndoUsed + len > sizeof(g_UndoData)) { g_UndoFull = TRUE; return; }
+    memcpy(g_UndoData + g_UndoUsed, addr, len);
+    g_Undo[g_UndoCount].Addr = (DWORD)addr;
+    g_Undo[g_UndoCount].Len  = len;
+    g_Undo[g_UndoCount].Off  = g_UndoUsed;
+    g_UndoCount++;
+    g_UndoUsed += len;
+}
+
+static int CmpSubst(const void* a, const void* b)
+{
+    DWORD x = ((const XP_SUBST*)a)->Addr, y = ((const XP_SUBST*)b)->Addr;
+    return x < y ? -1 : (x > y ? 1 : 0);
+}
+
+// portable part: raw XXH3 and Xenia-style XXH3 of [start, start+len) at p,
+// using the (sorted) substitutions in g_Subst
+static void HashRange(const BYTE* p, DWORD start, DWORD len, XP_HASH* h)
+{
+
+    static XXH3_state_t st;   // static: keep it off the thread stack
+    XXH3_64bits_reset(&st);
+    DWORD done = 0;
+    for (int k = 0; k < g_SubstCount; k++) {
+        const XP_SUBST* s = &g_Subst[k];
+        const BYTE* data = s->Data;
+        DWORD       dlen = s->Len;
+        if (s->Addr < start || s->Addr - start + dlen > len) continue;
+        DWORD off = s->Addr - start;
+        if (off < done) continue;                 // overlapping entry, ignore
+        if (off > done) XXH3_64bits_update(&st, p + done, off - done);
+        XXH3_64bits_update(&st, data, dlen);
+        done = off + dlen;
+    }
+    if (len > done) XXH3_64bits_update(&st, p + done, len - done);
+    h->XeniaStyle = XXH3_64bits_digest(&st);
+}
+
+// Known-answer test: the same inputs hashed on a PC give these values.
+// If the console disagrees, the hash function itself is miscompiled.
+static BOOL g_HashWorks = FALSE;   // set by the self-test at start
+
+static BOOL HashSelfTest()
+{
+    static const char a[] = "XPatch self-test: XXH3-64 must match on PC and console";
+    static BYTE b[1000];
+    for (int i = 0; i < 1000; i++) b[i] = (BYTE)(i * 31 + 7);
+    UINT64 ha = XXH3_64bits(a, sizeof(a) - 1);
+    UINT64 hb = XXH3_64bits(b, sizeof(b));
+    BOOL ok = (ha == 0x58C80386253F6DE5ULL) && (hb == 0x989765D0EA7A5ECDULL);
+    Log("Hash self-test: %s (short %08X%08X, long %08X%08X)", ok ? "OK" : "FAILED",
+        (DWORD)(ha >> 32), (DWORD)ha, (DWORD)(hb >> 32), (DWORD)hb);
+    return ok;
+}
+
+// MmIsAddressValid for every 4 KB page of [p, p+len)
+static BOOL Readable(const void* p, DWORD len)
+{
+    DWORD a = (DWORD)p & ~0xFFFu, end = (DWORD)p + len;
+    for (; a < end; a += 0x1000)
+        if (!MmIsAddressValid((PVOID)a)) return FALSE;
+    return TRUE;
+}
+
+// optional XEX header by key; the value is an offset in the file and an
+// absolute address on the console (like the security info field)
+static BYTE* FindOptHeader(BYTE* xex, DWORD hdrSize, DWORD key)
+{
+    DWORD n = Be32(xex + 0x14);
+    if (n == 0 || n > 256 || !Readable(xex + 0x18, n * 8)) return NULL;
+    for (DWORD i = 0; i < n; i++) {
+        if (Be32(xex + 0x18 + i * 8) != key) continue;
+        DWORD v   = Be32(xex + 0x18 + i * 8 + 4);
+        DWORD off = (v >= (DWORD)xex) ? v - (DWORD)xex : v;
+        if (off < 0x18 || (hdrSize && off >= hdrSize)) return NULL;
+        return xex + off;
+    }
+    return NULL;
+}
+
+// is the address in a CODE section? (real page layout: descriptors with page counts)
+static BOOL IsCodeAddr(DWORD a, DWORD base, const BYTE* desc, DWORD count, DWORD realPage)
+{
+    if (a < base) return FALSE;
+    DWORD pg = (a - base) / realPage, acc = 0;
+    for (DWORD i = 0; i < count; i++) {
+        DWORD v  = Be32(desc + i * 0x18);
+        DWORD pc = v >> 4;
+        if (pg < acc + pc) return (v & 0xF) == XEX_SECTION_CODE;
+        acc += pc;
+    }
+    return FALSE;
+}
+
+static BOOL SameNoCase(const char* a, const char* b)
+{
+    for (; *a && *b; a++, b++) {
+        char x = (*a >= 'A' && *a <= 'Z') ? *a + 32 : *a;
+        char y = (*b >= 'A' && *b <= 'Z') ? *b + 32 : *b;
+        if (x != y) return FALSE;
+    }
+    return *a == *b;
+}
+
+static void BuildImportSubst(BYTE* xex, DWORD hdrSize, DWORD base,
+                             const BYTE* desc, DWORD count, DWORD realPage, XP_HASH* h)
+{
+    g_SubstCount = 0;
+    BYTE* imp = FindOptHeader(xex, hdrSize, XEX_HEADER_IMPORT_LIBRARIES);
+    if (!imp || !Readable(imp, 12)) { Log("Hash: no import table"); return; }
+    DWORD total = Be32(imp), strSize = Be32(imp + 4), strCount = Be32(imp + 8);
+    if (total < 12 || total > 0x100000 || !Readable(imp, total) || strSize >= total) {
+        Log("Hash: odd import table (size %X)", total);
+        return;
+    }
+
+    const char* names[32];
+    memset(names, 0, sizeof(names));
+    for (DWORD i = 0, o = 0; i < strSize && o < strCount && o < 32; o++) {
+        names[o] = (const char*)(imp + 12 + i);
+        i += (DWORD)strlen(names[o]) + 1;
+        if (i % 4) i += 4 - (i % 4);
+    }
+
+    DWORD off = strSize + 12;
+    while (off + 0x28 <= total) {
+        const BYTE* lib = imp + off;
+        DWORD lsize = Be32(lib);
+        if (!lsize || off + lsize > total) break;
+        DWORD nameIdx = (Be32(lib + 0x24) >> 16) & 0xFF;
+        DWORD cnt     =  Be32(lib + 0x24) & 0xFFFF;
+        const char* nm = (nameIdx < 32 && names[nameIdx]) ? names[nameIdx] : "?";
+        BOOL kernel = SameNoCase(nm, "xboxkrnl.exe") || SameNoCase(nm, "xam.xex") ||
+                      SameNoCase(nm, "xbdm.xex");
+        if (0x28 + cnt * 4 > lsize) break;
+
+        for (DWORD r = 0; r < cnt; r++) {
+            DWORD a       = Be32(lib + 0x28 + r * 4);
+            BOOL  inRange = (a >= h->Start && a < h->End);
+            if (IsCodeAddr(a, base, desc, count, realPage)) {
+                // thunk
+                if (!inRange) continue;
+                if (kernel) { AddSubst(a, g_XThunk, 16); h->Thunks++; }
+                else        { h->UserThunks++; }
+            } else {
+                // descriptor: a function if the next record is its thunk
+                BOOL func = (r + 1 < cnt) &&
+                            IsCodeAddr(Be32(lib + 0x28 + (r + 1) * 4), base, desc, count, realPage);
+                if (!inRange) continue;
+                if (func && kernel) { AddSubst(a, g_XFunc, 4); h->FuncSlots++; }
+                else                { h->VarSlots++; }
+            }
+        }
+        off += lsize;
+    }
+    qsort(g_Subst, g_SubstCount, sizeof(XP_SUBST), CmpSubst);
+}
+
+static void ComputeModuleHash(XP_HASH* h, BOOL asBeforeWrites)
+{
+    memset(h, 0, sizeof(*h));
+
+    // XexExecutableModuleHandle (xboxkrnl #0x193) holds the running title's
+    // loader entry; +0x1C = image base, +0x58 = XEX header in memory.
+    HANDLE krnl = NULL;
+    PVOID  var  = NULL;
+    if (XexGetModuleHandle("xboxkrnl.exe", &krnl) != 0 || !krnl) { Log("Hash: no xboxkrnl handle"); return; }
+    if (XexGetProcedureAddress(krnl, 0x193, &var) != 0 || !var)  { Log("Hash: no XexExecutableModuleHandle"); return; }
+    if (!Readable(var, 4)) { Log("Hash: handle variable %08X not readable", (DWORD)var); return; }
+
+    BYTE* ldr = *(BYTE**)var;
+    if (!ldr || !Readable(ldr, 0x5C)) { Log("Hash: bad loader entry %08X", (DWORD)ldr); return; }
+    DWORD base = *(DWORD*)(ldr + 0x1C);
+    BYTE* xex  = *(BYTE**)(ldr + 0x58);
+    if (!xex || !Readable(xex, 0x18) || *(DWORD*)xex != 0x58455832) {   // 'XEX2'
+        Log("Hash: XEX header not found (%08X)", (DWORD)xex);
+        return;
+    }
+
+    // In the file this field is an offset from the header start. The console's
+    // loader rewrites it into an absolute address (seen: header 8E050000,
+    // field 8E050098), Xenia keeps the offset. Accept both, inside the header.
+    DWORD hdrSize = *(DWORD*)(xex + 0x08);
+    DWORD secFld  = *(DWORD*)(xex + 0x10);
+    DWORD secOff  = (secFld >= (DWORD)xex) ? secFld - (DWORD)xex : secFld;
+    if (secOff < 0x18 || secOff > 0x100000 || (hdrSize && secOff >= hdrSize)) {
+        Log("Hash: odd security field %08X (header %08X, size %X)", secFld, (DWORD)xex, hdrSize);
+        return;
+    }
+    BYTE* sec = xex + secOff;
+    if (!Readable(sec, 0x184)) { Log("Hash: security info %08X not readable", (DWORD)sec); return; }
+    DWORD count = *(DWORD*)(sec + 0x180);
+    if (count == 0 || count > 0x10000) { Log("Hash: odd descriptor count %u", count); return; }
+    BYTE* desc = sec + 0x184;                 // 0x18 bytes each: value + digest
+    if (!Readable(desc, count * 0x18)) { Log("Hash: descriptors not readable"); return; }
+
+    DWORD first = 0xFFFFFFFF, last = 0xFFFFFFFF;
+    for (DWORD i = 0; i < count; i++) {
+        DWORD v = *(DWORD*)(desc + i * 0x18);
+        if ((v & 0xF) == XEX_SECTION_CODE) {
+            if (first == 0xFFFFFFFF) first = i;
+            last = i;
+        }
+    }
+    if (first == 0xFFFFFFFF) { Log("Hash: no code section"); return; }
+
+    // Xenia's heap page size for the base address (used with the descriptor index)
+    DWORD page = (base >= 0x90000000 && base < 0xA0000000) ? 0x1000 : 0x10000;
+    // real page size of the image (used to find which section an address is in)
+    DWORD realPage = (*(DWORD*)(sec + 0x10C) & XEX_IMAGE_PAGE_SIZE_4KB) ? 0x1000 : 0x10000;
+
+    h->Start = base + first * page;
+    h->End   = base + (last + 1) * page;
+    h->PageSize = page; h->Descriptors = count; h->FirstCode = first; h->LastCode = last;
+    if (h->End <= h->Start || h->End - h->Start > 0x4000000) { Log("Hash: odd range %08X-%08X", h->Start, h->End); return; }
+    if (!Readable((void*)h->Start, h->End - h->Start)) { Log("Hash: range %08X-%08X not readable", h->Start, h->End); return; }
+
+    BuildImportSubst(xex, hdrSize, base, desc, count, realPage, h);
+    if (asBeforeWrites) {
+        // put XPatch360's own writes back to the original bytes while hashing
+        for (int u = 0; u < g_UndoCount; u++)
+            AddSubst(g_Undo[u].Addr, g_UndoData + g_Undo[u].Off, g_Undo[u].Len);
+        qsort(g_Subst, g_SubstCount, sizeof(XP_SUBST), CmpSubst);
+    }
+    HashRange((const BYTE*)h->Start, h->Start, h->End - h->Start, h);
+    h->Ok = TRUE;
+}
+
+// "797B4775D3BC9853" -> value; FALSE if not 16 hex digits
+static BOOL ParseHash64(const char* s, UINT64* out)
+{
+    UINT64 v = 0; int n = 0;
+    for (; *s && n < 16; s++) {
+        int d = (*s >= '0' && *s <= '9') ? *s - '0' :
+                (*s >= 'a' && *s <= 'f') ? *s - 'a' + 10 :
+                (*s >= 'A' && *s <= 'F') ? *s - 'A' + 10 : -1;
+        if (d < 0) return FALSE;
+        v = (v << 4) | (UINT64)d; n++;
+    }
+    if (n != 16) return FALSE;
+    *out = v;
+    return TRUE;
 }
 
 // --------------------------------------------------------------------------
@@ -304,6 +659,7 @@ static void FlushWrite(XP_WRITE* w, DWORD titleId, const char* patchName, BOOL e
         (*errors)++;
         return;
     }
+    UndoSave(dst, len);                 // original bytes, for the cache check / undo
     memcpy(dst, g_Data, len);
     FlushRange(dst, len);
     (*writes)++;
@@ -313,7 +669,7 @@ static void FlushWrite(XP_WRITE* w, DWORD titleId, const char* patchName, BOOL e
 typedef struct {
     int PatchesOk;      // enabled patches whose every write succeeded
     int PatchesFailed;  // enabled patches with at least one failed write
-    int PatchesSkipped; // enabled patches in files skipped for a media_id mismatch
+    int PatchesSkipped; // enabled patches in files made for another game version
 } XP_RESULT;
 
 // called when an enabled [[patch]] block ends
@@ -350,7 +706,32 @@ static int TuFromVersion(DWORD version)
     return (int)((version >> 8) & 0xFFFF);
 }
 
-static void ApplyToml(const char* path, const XP_EXEC_ID* exec, XP_RESULT* r, BOOL wrongVersion)
+// every "XXXXXXXXXXXXXXXX" (16 hex digits) in a line -> list
+static void CollectHashes(const char* s, UINT64* list, int* n, int max)
+{
+    while (*s) {
+        if (*s == '"') {
+            const char* q = s + 1;
+            const char* e = strchr(q, '"');
+            if (!e) return;
+            char tmp[32];
+            int len = (int)(e - q);
+            if (len < (int)sizeof(tmp)) {
+                memcpy(tmp, q, len); tmp[len] = 0;
+                UINT64 v;
+                if (ParseHash64(tmp, &v) && *n < max) list[(*n)++] = v;
+            }
+            s = e + 1;
+        } else s++;
+    }
+}
+
+// Which files are used:
+//   - module hash available: only files whose "hash" lists the running game's hash
+//   - otherwise (fallback, as in v1.0): the "(TUn)" tag in the file name must
+//     match the running TU, and a media_id list (if any) must contain the disc
+static void ApplyToml(const char* path, const XP_EXEC_ID* exec, XP_RESULT* r, BOOL tuMismatch,
+                      const XP_HASH* mh)
 {
     FILE* f = fopen(path, "rb");
     if (!f) return;
@@ -361,9 +742,13 @@ static void ApplyToml(const char* path, const XP_EXEC_ID* exec, XP_RESULT* r, BO
     char patchName[96] = "";
     BOOL inPatch = FALSE, enabled = FALSE, topLevel = TRUE;
     int  writes = 0, errors = 0, patchesOn = 0, errorsAtStart = 0;
-    BOOL skipFile = wrongVersion;   // enabled patches are only counted, not applied
+    BOOL skipFile = FALSE;          // enabled patches are only counted, not applied
+    BOOL decided = FALSE, mediaMismatch = FALSE;
     int  skippedBefore = r->PatchesSkipped;
     XP_WRITE w; memset(&w, 0, sizeof(w));
+
+    UINT64 fileHashes[16]; int fileHashCount = 0;
+    BOOL   inHashList = FALSE;
 
     char* line = g_FileBuf;
     while (*line) {
@@ -374,7 +759,26 @@ static void ApplyToml(const char* path, const XP_EXEC_ID* exec, XP_RESULT* r, BO
         StripComment(line);
         char* s = Trim(line);
 
+        if (inHashList) {               // continuation of  hash = [ ... ]
+            CollectHashes(s, fileHashes, &fileHashCount, 16);
+            if (strchr(s, ']')) inHashList = FALSE;
+            line = next;
+            continue;
+        }
+
         if (*s == '[') {
+            if (!decided) {
+                // the top-level keys (hash, media_id) are all read by now
+                decided = TRUE;
+                if (mh->Ok) {
+                    BOOL match = FALSE;
+                    for (int k = 0; k < fileHashCount; k++)
+                        if (fileHashes[k] == mh->XeniaStyle) match = TRUE;
+                    skipFile = !match;
+                } else {
+                    skipFile = tuMismatch || mediaMismatch;
+                }
+            }
             FlushWrite(&w, exec->TitleId, patchName, enabled, &writes, &errors);
             topLevel = FALSE;
 
@@ -401,13 +805,13 @@ static void ApplyToml(const char* path, const XP_EXEC_ID* exec, XP_RESULT* r, BO
                 char* val = Trim(eq + 1);
 
                 if (topLevel) {
-                    if (!strcmp(key, "media_id")) {
+                    if (!strcmp(key, "hash")) {
+                        CollectHashes(val, fileHashes, &fileHashCount, 16);
+                        if (strchr(val, '[') && !strchr(val, ']')) inHashList = TRUE;
+                    } else if (!strcmp(key, "media_id")) {
                         BOOL any;
-                        if (!MediaListed(val, exec->MediaId, &any) && any) {
-                            Log("[%08X] %s: media_id does not match %08X - file skipped",
-                                exec->TitleId, path, exec->MediaId);
-                            skipFile = TRUE;   // keep reading only to count enabled patches
-                        }
+                        if (!MediaListed(val, exec->MediaId, &any) && any)
+                            mediaMismatch = TRUE;   // used only when the hash is unavailable
                     }
                 } else if (w.Active) {
                     if (!strcmp(key, "address")) { w.Address = (DWORD)ParseInt(val); w.HasAddress = TRUE; }
@@ -434,12 +838,24 @@ static void ApplyToml(const char* path, const XP_EXEC_ID* exec, XP_RESULT* r, BO
     if (inPatch && enabled)
         EndPatch(exec->TitleId, patchName, errorsAtStart, errors, r);
 
-    if (skipFile && r->PatchesSkipped > skippedBefore)
-        Log("[%08X] v%08X: %d enabled patches SKIPPED - file is for another version (%s)",
-            exec->TitleId, exec->Version, r->PatchesSkipped - skippedBefore, path);
-    else
-        Log("[%08X] v%08X: %d patches on, %d writes, %d errors (%s)",
-            exec->TitleId, exec->Version, patchesOn, writes, errors, path);
+    if (skipFile && r->PatchesSkipped > skippedBefore) {
+        if (mh->Ok) {
+            char list[80]; int n = 0; list[0] = 0;
+            for (int k = 0; k < fileHashCount && n < 60; k++)
+                n += _snprintf(list + n, sizeof(list) - n, "%s%08X%08X", k ? "," : "",
+                               (DWORD)(fileHashes[k] >> 32), (DWORD)fileHashes[k]);
+            list[sizeof(list) - 1] = 0;
+            Log("[%08X] %d enabled patches SKIPPED - file is for another game version "
+                "(file hash %s) (%s)", exec->TitleId, r->PatchesSkipped - skippedBefore,
+                fileHashCount ? list : "none", path);
+        } else {
+            Log("[%08X] %d enabled patches SKIPPED - %s does not match (%s)", exec->TitleId,
+                r->PatchesSkipped - skippedBefore, tuMismatch ? "TU" : "media_id", path);
+        }
+    } else {
+        Log("[%08X] %d patches on, %d writes, %d errors (%s)",
+            exec->TitleId, patchesOn, writes, errors, path);
+    }
 }
 
 // --------------------------------------------------------------------------
@@ -499,47 +915,195 @@ static void Notify(const char* text)
     CloseHandle(h);
 }
 
-static void ApplyPatches(const XP_EXEC_ID* exec)
+// --------------------------------------------------------------------------
+// Hash cache: Hdd:\Patches\XPatch360.cache, one line per game version:
+//   <TitleId> <Version> <BaseVersion> <MediaId> <hash>
+// With a cached hash the patches are written at once (no time lost while the
+// game starts, so early patches like "Skip Legal Screens" still work); the
+// hash is then checked against the memory as it was before the writes, and
+// everything is undone if it does not match.
+// --------------------------------------------------------------------------
+#define XP_CACHE XP_DIR "XPatch360.cache"
+typedef struct { DWORD TitleId, Version, BaseVersion, MediaId; UINT64 Hash; } XP_CACHE_ENTRY;
+#define XP_MAX_CACHE 256
+static XP_CACHE_ENTRY g_Cache[XP_MAX_CACHE];
+static int            g_CacheCount  = 0;
+static BOOL           g_CacheLoaded = FALSE;
+
+static void CacheLoad()
 {
-    // Xenia naming: "<TITLEID> - <Game>.patch.toml" (more than one file is fine)
+    g_CacheLoaded = TRUE;
+    g_CacheCount  = 0;
+    FILE* f = fopen(XP_CACHE, "rb");
+    if (!f) return;
+    char line[128];
+    while (fgets(line, sizeof(line), f) && g_CacheCount < XP_MAX_CACHE) {
+        char* t[5]; int n = 0;
+        char* p = line;
+        while (*p && n < 5) {
+            while (*p == ' ' || *p == '\t') p++;
+            if (!*p || *p == '\r' || *p == '\n') break;
+            t[n++] = p;
+            while (*p && *p != ' ' && *p != '\t' && *p != '\r' && *p != '\n') p++;
+            if (*p) *p++ = 0;
+        }
+        if (n != 5) continue;
+        XP_CACHE_ENTRY e;
+        e.TitleId     = strtoul(t[0], NULL, 16);
+        e.Version     = strtoul(t[1], NULL, 16);
+        e.BaseVersion = strtoul(t[2], NULL, 16);
+        e.MediaId     = strtoul(t[3], NULL, 16);
+        if (!ParseHash64(t[4], &e.Hash)) continue;
+        g_Cache[g_CacheCount++] = e;
+    }
+    fclose(f);
+}
+
+static int CacheIndex(const XP_EXEC_ID* x)
+{
+    if (!g_CacheLoaded) CacheLoad();
+    for (int i = 0; i < g_CacheCount; i++)
+        if (g_Cache[i].TitleId == x->TitleId && g_Cache[i].Version == x->Version &&
+            g_Cache[i].BaseVersion == x->BaseVersion && g_Cache[i].MediaId == x->MediaId)
+            return i;
+    return -1;
+}
+
+static void CacheStore(const XP_EXEC_ID* x, UINT64 hash)
+{
+    int i = CacheIndex(x);
+    if (i < 0) {
+        if (g_CacheCount >= XP_MAX_CACHE) return;
+        i = g_CacheCount++;
+        g_Cache[i].TitleId = x->TitleId;   g_Cache[i].Version = x->Version;
+        g_Cache[i].BaseVersion = x->BaseVersion; g_Cache[i].MediaId = x->MediaId;
+    }
+    g_Cache[i].Hash = hash;
+    FILE* f = fopen(XP_CACHE, "wb");
+    if (!f) return;
+    for (int k = 0; k < g_CacheCount; k++)
+        fprintf(f, "%08X %08X %08X %08X %08X%08X\r\n", g_Cache[k].TitleId, g_Cache[k].Version,
+                g_Cache[k].BaseVersion, g_Cache[k].MediaId,
+                (DWORD)(g_Cache[k].Hash >> 32), (DWORD)g_Cache[k].Hash);
+    fclose(f);
+}
+
+// one pass over the title's patch files
+static void ApplyAllFiles(const XP_EXEC_ID* exec, const XP_HASH* mh, XP_RESULT* r)
+{
     char pattern[64];
     _snprintf(pattern, sizeof(pattern), XP_DIR "%08X*.toml", exec->TitleId);
-
-    XP_RESULT r; memset(&r, 0, sizeof(r));
     int runTu = TuFromVersion(exec->Version);
 
     WIN32_FIND_DATA fd;
     HANDLE h = FindFirstFile(pattern, &fd);
-    if (h == INVALID_HANDLE_VALUE) return;      // no patches for this title
-    Log("[%08X] running TU%d", exec->TitleId, runTu);
+    if (h == INVALID_HANDLE_VALUE) return;
     do {
         if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
         char path[MAX_PATH];
         _snprintf(path, sizeof(path), XP_DIR "%s", fd.cFileName);
         path[sizeof(path) - 1] = 0;
-        // "(TU27)" files only on TU27; files without a TU tag only on the base game
-        BOOL wrongVersion = (TuFromFileName(fd.cFileName) != runTu);
-        ApplyToml(path, exec, &r, wrongVersion);
+        // fallback rule: "(TU27)" files only on TU27, untagged files only on the base game
+        BOOL tuMismatch = (TuFromFileName(fd.cFileName) != runTu);
+        ApplyToml(path, exec, r, tuMismatch, mh);
     } while (FindNextFile(h, &fd));
     FindClose(h);
+}
+
+static void UndoAll()
+{
+    for (int u = g_UndoCount - 1; u >= 0; u--) {
+        BYTE* dst = (BYTE*)g_Undo[u].Addr;
+        memcpy(dst, g_UndoData + g_Undo[u].Off, g_Undo[u].Len);
+        FlushRange(dst, g_Undo[u].Len);
+    }
+    g_UndoCount = 0; g_UndoUsed = 0;
+}
+
+static void ApplyPatches(const XP_EXEC_ID* exec)
+{
+    // any patch files for this title at all?
+    char pattern[64];
+    _snprintf(pattern, sizeof(pattern), XP_DIR "%08X*.toml", exec->TitleId);
+    WIN32_FIND_DATA fd;
+    HANDLE fh = FindFirstFile(pattern, &fd);
+    if (fh == INVALID_HANDLE_VALUE) return;      // no patches for this title
+    FindClose(fh);
+
+    g_LogDefer = TRUE;                           // no disk writes until patched
+    Log("[%08X] running TU%d", exec->TitleId, TuFromVersion(exec->Version));
+
+    static XP_HASH mh;
+    XP_RESULT r; memset(&r, 0, sizeof(r));
+    memset(&mh, 0, sizeof(mh));
+    UndoReset();
+
+    int ci = g_HashWorks ? CacheIndex(exec) : -1;
+    if (ci >= 0) {
+        // fast path: cached hash -> patch now, check afterwards
+        mh.Ok = TRUE;
+        mh.XeniaStyle = g_Cache[ci].Hash;
+        ApplyAllFiles(exec, &mh, &r);
+
+        XP_HASH real;
+        if (g_UndoFull) {
+            Log("[%08X] module hash %08X%08X (cached, not re-checked: too many writes)",
+                exec->TitleId, (DWORD)(mh.XeniaStyle >> 32), (DWORD)mh.XeniaStyle);
+        } else {
+            ComputeModuleHash(&real, TRUE);      // memory as it was before our writes
+            if (real.Ok && real.XeniaStyle == mh.XeniaStyle) {
+                Log("[%08X] module hash %08X%08X (cached, checked)", exec->TitleId,
+                    (DWORD)(mh.XeniaStyle >> 32), (DWORD)mh.XeniaStyle);
+            } else if (real.Ok) {
+                // the cache was wrong: undo everything and decide again
+                Log("[%08X] cached hash %08X%08X is outdated, real %08X%08X - %d writes undone",
+                    exec->TitleId, (DWORD)(mh.XeniaStyle >> 32), (DWORD)mh.XeniaStyle,
+                    (DWORD)(real.XeniaStyle >> 32), (DWORD)real.XeniaStyle, g_UndoCount);
+                UndoAll();
+                CacheStore(exec, real.XeniaStyle);
+                memset(&r, 0, sizeof(r));
+                mh = real;
+                UndoReset();
+                ApplyAllFiles(exec, &mh, &r);
+            } else {
+                Log("[%08X] module hash %08X%08X (cached, could not re-check)", exec->TitleId,
+                    (DWORD)(mh.XeniaStyle >> 32), (DWORD)mh.XeniaStyle);
+            }
+        }
+    } else {
+        // first run of this game version: hash first, then patch
+        if (g_HashWorks) ComputeModuleHash(&mh, FALSE);
+        if (mh.Ok) {
+            Log("[%08X] module hash %08X%08X (computed, cached for next time)", exec->TitleId,
+                (DWORD)(mh.XeniaStyle >> 32), (DWORD)mh.XeniaStyle);
+        } else {
+            Log("[%08X] module hash not available - using the TU check of v1.0", exec->TitleId);
+        }
+        ApplyAllFiles(exec, &mh, &r);
+        if (mh.Ok) {
+            g_LogDefer = FALSE;                  // CacheStore writes to disk anyway
+            CacheStore(exec, mh.XeniaStyle);
+        }
+    }
+    LogFlush();
 
     // Nothing enabled for this game -> stay quiet
     if (r.PatchesOk + r.PatchesFailed + r.PatchesSkipped == 0) return;
 
     char msg[128];
     if (r.PatchesFailed == 0 && r.PatchesOk > 0 && r.PatchesSkipped == 0)
-        _snprintf(msg, sizeof(msg), "XPatch: %d patch%s applied successfully",
+        _snprintf(msg, sizeof(msg), "XPatch360: %d patch%s applied successfully",
                   r.PatchesOk, r.PatchesOk == 1 ? "" : "es");
     else if (r.PatchesOk > 0 && r.PatchesFailed == 0)
-        _snprintf(msg, sizeof(msg), "XPatch: %d applied, %d skipped (other TU)",
+        _snprintf(msg, sizeof(msg), "XPatch360: %d applied, %d skipped (other game version)",
                   r.PatchesOk, r.PatchesSkipped);
     else if (r.PatchesOk > 0)
-        _snprintf(msg, sizeof(msg), "XPatch: %d applied, %d failed", r.PatchesOk, r.PatchesFailed);
+        _snprintf(msg, sizeof(msg), "XPatch360: %d applied, %d failed", r.PatchesOk, r.PatchesFailed);
     else if (r.PatchesFailed > 0)
-        _snprintf(msg, sizeof(msg), "XPatch: failed to apply %d patch%s",
+        _snprintf(msg, sizeof(msg), "XPatch360: failed to apply %d patch%s",
                   r.PatchesFailed, r.PatchesFailed == 1 ? "" : "es");
     else
-        _snprintf(msg, sizeof(msg), "XPatch: %d patch%s skipped (made for another TU)",
+        _snprintf(msg, sizeof(msg), "XPatch360: %d patch%s skipped - game version doesn't match",
                   r.PatchesSkipped, r.PatchesSkipped == 1 ? "" : "es");
     msg[sizeof(msg) - 1] = 0;
 
@@ -556,7 +1120,9 @@ static void ApplyPatches(const XP_EXEC_ID* exec)
 static void __cdecl MainThread(void*)
 {
     if (!WaitForHdd()) return;   // no hard disk -> nothing to patch from
-    Log("XPatch started");
+    Log("XPatch360 v" XPATCH_VERSION " started");
+    g_HashWorks = HashSelfTest();
+    CacheLoad();                 // read once now, not while a game is starting
 
     DWORD lastTitle = 0;
     while (g_Running) {
@@ -581,7 +1147,8 @@ BOOL APIENTRY DllMain(HANDLE hModule, DWORD reason, LPVOID)
         HANDLE hThread;
         DWORD tid;
         // 0x2 = system thread, survives title switches
-        ExCreateThread(&hThread, 0, &tid, (PVOID)XapiThreadStartup,
+        // 32 KB stack: enough for the hashing code (its state is static)
+        ExCreateThread(&hThread, 0x8000, &tid, (PVOID)XapiThreadStartup,
                        (LPTHREAD_START_ROUTINE)MainThread, NULL, 0x2 | CREATE_SUSPENDED);
         XSetThreadProcessor(hThread, 4);
         ResumeThread(hThread);
