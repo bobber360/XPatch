@@ -1,0 +1,62 @@
+# XPatch360 converter fix - Gears of War TU5
+# Applied by Convert-XeniaPatches.ps1 (v1.2) to the Xenia file with this title ID and hash.
+#   remove: Xenia patches that don't work on a real console, or are renamed below (by name)
+#   then every [[patch]] below is appended to the converted file.
+title_id = "4D5307D5"
+hash = "34849A59634915F6"
+remove = ["Black Shading Fix", "Texture Streaming Fix", "21:9 Ultrawide Aspect Ratio Support", "Steam Deck / 16:10 Aspect Ratio Support", "Disable Motion Blur", "Upscaling Fix - Disable Gaussian Blur (sharper, less bloom/DoF)"]
+
+[[patch]]
+    name = "Resolution 1120x630 (console)"
+    desc = "Made for a real Xbox 360: renders at 1120x630 instead of 1280x720, the console scales it to the TV output. A big FPS gain with the 60 FPS patch (up to ~60, 40-50 in heavy scenes)."
+    author = "bobber360 & Claude"
+    is_enabled = false
+
+    [[patch.be32]]
+        address = 0x824bc444
+        value = 0x39600276 # device init: render height 720 -> 630
+    [[patch.be32]]
+        address = 0x824bc490
+        value = 0x39600276 # back buffer height 720 -> 630
+    [[patch.be32]]
+        address = 0x824bc550
+        value = 0x2f1f0460 # cmpwi r31,1120 (was 1280)
+    [[patch.be32]]
+        address = 0x824bc558
+        value = 0x3be00460 # li r31,1120: render width (was 1280)
+
+[[patch]]
+    name = "Disable 2x MSAA (console)"
+    desc = "Made for a real Xbox 360 (the Xenia Black Shading Fix, renamed): turns off 2x MSAA and the EDRAM tiling it needs. Less work for the GPU (e.g. 27.3 -> 23.6 ms per frame), edges are a bit more jagged."
+    author = "boma, bobber360 & Claude"
+    is_enabled = false
+
+    [[patch.be8]]
+        address = 0x82f9779b # GUseTilingCode = FALSE
+        value = 0x00
+    [[patch.be8]]
+        address = 0x82f97733 # GTilingMode = 4
+        value = 0x04
+
+[[patch]]
+    name = "Disable Motion Blur"
+    desc = "Not needed if Disable All Post-Processing is on (motion blur is part of the post-processing chain)."
+    author = "illusion, boma"
+    is_enabled = false
+
+    [[patch.be32]]
+        address = 0x82548e34
+        value = 0x39600000
+
+[[patch]]
+    name = "Disable Gaussian Blur"
+    desc = "Forces the blur radius to 0: a sharper image with less bloom and depth of field. Not needed if Disable All Post-Processing is on."
+    author = "boma"
+    is_enabled = false
+
+    [[patch.be8]]
+        address = 0x8253956b
+        value = 0x00
+    [[patch.be8]]
+        address = 0x8255af0b
+        value = 0x00

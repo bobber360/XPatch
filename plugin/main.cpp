@@ -1,4 +1,4 @@
-// XPatch360 v1.1
+// XPatch360 v1.2
 // Runtime game patcher Dashlaunch plugin (Xbox 360 RGH/JTAG)
 // Authors: bobber360 & Claude
 //
@@ -11,12 +11,13 @@
 //
 // Build: build.bat (Xbox 360 SDK) -> XPatch360.xex
 // Load:  launch.ini ->  pluginN = Hdd:\XPatch360.xex
-// Log:   Hdd:\Patches\XPatch360.log
+// Own files: Hdd:\Patches\XPatch360\ (XPatch360.log, .ini, .cache, .dump, dumps *.bin)
+// Settings: Hdd:\Patches\XPatch360\XPatch360.ini (created with defaults if missing)
 //
 // Uses xxHash (BSD 2-Clause, https://github.com/Cyan4973/xxHash) for the
 // XXH3-64 module hash that Xenia Canary writes into the "hash" field.
 
-#define XPATCH_VERSION "1.1"
+#define XPATCH_VERSION "1.2"
 
 #include <xtl.h>
 #include <stdio.h>
@@ -71,12 +72,71 @@ typedef struct _XP_EXEC_ID {
 } XP_EXEC_ID;
 #pragma pack(pop)
 
-#define XP_DIR       "Hdd:\\Patches\\"
-#define XP_LOG       XP_DIR "XPatch360.log"
-#define XP_MAX_FILE  (512 * 1024)
+#define XP_DIR       "Hdd:\\Patches\\"            // the .toml patch files
+#define XP_DATA      XP_DIR "XPatch360\\"             // XPatch360's own files (log, ini, cache, dumps)
+#define XP_LOG       XP_DATA "XPatch360.log"
+#define XP_MAX_FILE  (128 * 1024)   // biggest .toml file read (Xenia files are 2-10 KB)
+#ifndef INVALID_FILE_ATTRIBUTES          // not in the Xbox 360 SDK headers
+#define INVALID_FILE_ATTRIBUTES ((DWORD)-1)
+#endif
 
 static BOOL g_Running = TRUE;
 static char g_FileBuf[XP_MAX_FILE + 1];
+
+// --------------------------------------------------------------------------
+// Settings: Hdd:\Patches\XPatch360\XPatch360.ini - read at boot and every time a game
+// starts, so a change (by hand or from the Aurora script) needs no reboot.
+// --------------------------------------------------------------------------
+#define XP_INI XP_DATA "XPatch360.ini"
+
+typedef struct {
+    BOOL  Notify;      // notification when a game starts
+    BOOL  FullLog;     // TRUE: everything, FALSE: errors only
+    DWORD LogMaxKb;    // log bigger than this at boot -> deleted, started again
+    BOOL  EarlyPatch;  // reserved: patch before the title's entry point (not implemented)
+    BOOL  Debug;       // memory dumps (XPatch360.dump), "DEBUG MODE" in the log
+} XP_CFG;
+static XP_CFG g_Cfg = { TRUE, TRUE, 64, FALSE, FALSE };
+
+static const char g_IniDefault[] =
+    "; XPatch360 settings - read at boot and every time a game starts\r\n"
+    "; 1 = on, 0 = off. Can also be changed in Aurora: Utilities -> XPatch360 -> Settings\r\n"
+    "[XPatch360]\r\n"
+    "notify      = 1     ; notification when a game starts\r\n"
+    "log         = 1     ; 1 = full log, 0 = errors only\r\n"
+    "log_max_kb  = 64    ; a bigger log is deleted at boot and started again\r\n"
+    "early_patch = 0     ; patch before the game starts - for patches marked (early patching required)\r\n"
+    "debug       = 0     ; debug mode: memory dumps (XPatch360.dump), debug menu in Aurora\r\n";
+
+static void LoadSettings()
+{
+    FILE* f = fopen(XP_INI, "rb");
+    if (!f) {
+        f = fopen(XP_INI, "wb");                    // first run: write the defaults
+        if (f) { fwrite(g_IniDefault, 1, sizeof(g_IniDefault) - 1, f); fclose(f); }
+        return;
+    }
+    char line[160];
+    while (fgets(line, sizeof(line), f)) {
+        char* c = strchr(line, ';'); if (c) *c = 0;
+        char* eq = strchr(line, '=');
+        if (!eq) continue;
+        *eq = 0;
+        char* k = line; while (*k == ' ' || *k == '\t') k++;
+        char* ke = eq; while (ke > k && (ke[-1] == ' ' || ke[-1] == '\t')) *--ke = 0;
+        char* v = eq + 1; while (*v == ' ' || *v == '\t') v++;
+        BOOL on = (*v == '1' || *v == 't' || *v == 'T' || ((v[0] == 'o' || v[0] == 'O') && (v[1] == 'n' || v[1] == 'N')));
+        if      (!_stricmp(k, "notify"))      g_Cfg.Notify     = on;
+        else if (!_stricmp(k, "log"))         g_Cfg.FullLog    = on;
+        else if (!_stricmp(k, "early_patch")) g_Cfg.EarlyPatch = on;
+        else if (!_stricmp(k, "debug"))       g_Cfg.Debug      = on;
+        else if (!_stricmp(k, "log_max_kb")) {
+            DWORD n = strtoul(v, NULL, 10);
+            g_Cfg.LogMaxKb = (n < 8) ? 8 : (n > 4096 ? 4096 : n);
+        }
+    }
+    fclose(f);
+}
 
 // --------------------------------------------------------------------------
 // Logging
@@ -98,8 +158,11 @@ static void LogFlush()
     g_LogDefer = FALSE;
 }
 
+static BOOL g_LogError = FALSE;      // set by LogErr: written even with log = 0
+
 static void Log(const char* fmt, ...)
 {
+    if (!g_Cfg.FullLog && !g_LogError) return;
     char line[512];
     va_list ap;
     va_start(ap, fmt);
@@ -121,6 +184,18 @@ static void Log(const char* fmt, ...)
     if (f) { fputs(line, f); fclose(f); }
 }
 
+// errors and warnings: always in the log, also with "log = 0"
+#define LogErr(...) do { g_LogError = TRUE; Log(__VA_ARGS__); g_LogError = FALSE; } while (0)
+
+// at boot: a log bigger than log_max_kb is deleted and started again
+static void TrimLog()
+{
+    WIN32_FILE_ATTRIBUTE_DATA a;
+    if (GetFileAttributesEx(XP_LOG, GetFileExInfoStandard, &a) &&
+        a.nFileSizeLow > g_Cfg.LogMaxKb * 1024)
+        DeleteFile(XP_LOG);
+}
+
 static void MountHdd()
 {
     XP_STRING link, dev;
@@ -139,8 +214,20 @@ static BOOL WaitForHdd()
 {
     for (int i = 0; i < 120; i++) {
         MountHdd();
-        if (CreateDirectory("Hdd:\\Patches", NULL) || GetLastError() == ERROR_ALREADY_EXISTS)
+        if (CreateDirectory("Hdd:\\Patches", NULL) || GetLastError() == ERROR_ALREADY_EXISTS) {
+            CreateDirectory("Hdd:\\Patches\\XPatch360", NULL);
+            // v1.1 kept its files in Hdd:\Patches\ itself: move them over once
+            static const char* old[] = { "XPatch360.log", "XPatch360.cache", "XPatch360.ini", "XPatch360.dump" };
+            for (int k = 0; k < 4; k++) {
+                char from[64], to[64];
+                _snprintf(from, sizeof(from), XP_DIR "%s", old[k]);
+                _snprintf(to, sizeof(to), XP_DATA "%s", old[k]);
+                if (GetFileAttributes(from) != INVALID_FILE_ATTRIBUTES &&
+                    GetFileAttributes(to) == INVALID_FILE_ATTRIBUTES)
+                    MoveFile(from, to);
+            }
             return TRUE;
+        }
         Sleep(500);
     }
     return FALSE;
@@ -240,7 +327,54 @@ static BYTE    g_UndoData[16384];
 static DWORD   g_UndoUsed;
 static BOOL    g_UndoFull;
 
-static void UndoReset() { g_UndoCount = 0; g_UndoUsed = 0; g_UndoFull = FALSE; }
+// ---- conflict check: two enabled patches writing the same bytes ----
+// The later patch wins, which is rarely what the user wants (e.g. RDR
+// "Disable V-Sync" and "60 FPS V-Sync" both write 82C1F5BF): logged as an
+// error and counted in the notification.
+#define XP_MAX_TRACK  512
+#define XP_MAX_TNAMES 128
+#define XP_MAX_PAIRS  32
+typedef struct { DWORD Addr, Len; int Name; } XP_TRACK;
+static XP_TRACK g_Track[XP_MAX_TRACK];
+static int      g_TrackCount;
+static char     g_TrackNames[XP_MAX_TNAMES][64];
+static int      g_TrackNameCount;
+static int      g_Pairs[XP_MAX_PAIRS][2];
+static int      g_Conflicts;               // conflicting patch pairs in this game start
+
+static void TrackReset() { g_TrackCount = 0; g_TrackNameCount = 0; g_Conflicts = 0; }
+
+static void TrackWrite(DWORD titleId, const char* name, DWORD addr, DWORD len)
+{
+    int ni = -1;
+    for (int i = g_TrackNameCount - 1; i >= 0; i--)          // usually the last one
+        if (!strcmp(g_TrackNames[i], name)) { ni = i; break; }
+    if (ni < 0) {
+        if (g_TrackNameCount >= XP_MAX_TNAMES) return;
+        ni = g_TrackNameCount++;
+        strncpy(g_TrackNames[ni], name, 63);
+        g_TrackNames[ni][63] = 0;
+    }
+    for (int i = 0; i < g_TrackCount; i++) {
+        XP_TRACK* t = &g_Track[i];
+        if (t->Name == ni || addr >= t->Addr + t->Len || t->Addr >= addr + len) continue;
+        BOOL seen = FALSE;
+        int pairs = g_Conflicts < XP_MAX_PAIRS ? g_Conflicts : XP_MAX_PAIRS;
+        for (int k = 0; k < pairs; k++)
+            if (g_Pairs[k][0] == t->Name && g_Pairs[k][1] == ni) { seen = TRUE; break; }
+        if (seen) continue;
+        if (g_Conflicts < XP_MAX_PAIRS) { g_Pairs[g_Conflicts][0] = t->Name; g_Pairs[g_Conflicts][1] = ni; }
+        g_Conflicts++;
+        LogErr("[%08X] CONFLICT: '%s' and '%s' both write %08X ('%s' is applied last and wins)",
+               titleId, g_TrackNames[t->Name], name, addr > t->Addr ? addr : t->Addr, name);
+    }
+    if (g_TrackCount < XP_MAX_TRACK) {
+        g_Track[g_TrackCount].Addr = addr; g_Track[g_TrackCount].Len = len; g_Track[g_TrackCount].Name = ni;
+        g_TrackCount++;
+    }
+}
+
+static void UndoReset() { g_UndoCount = 0; g_UndoUsed = 0; g_UndoFull = FALSE; TrackReset(); }
 
 static void UndoSave(const BYTE* addr, DWORD len)
 {
@@ -294,8 +428,10 @@ static BOOL HashSelfTest()
     UINT64 ha = XXH3_64bits(a, sizeof(a) - 1);
     UINT64 hb = XXH3_64bits(b, sizeof(b));
     BOOL ok = (ha == 0x58C80386253F6DE5ULL) && (hb == 0x989765D0EA7A5ECDULL);
+    g_LogError = !ok;
     Log("Hash self-test: %s (short %08X%08X, long %08X%08X)", ok ? "OK" : "FAILED",
         (DWORD)(ha >> 32), (DWORD)ha, (DWORD)(hb >> 32), (DWORD)hb);
+    g_LogError = FALSE;
     return ok;
 }
 
@@ -353,10 +489,10 @@ static void BuildImportSubst(BYTE* xex, DWORD hdrSize, DWORD base,
 {
     g_SubstCount = 0;
     BYTE* imp = FindOptHeader(xex, hdrSize, XEX_HEADER_IMPORT_LIBRARIES);
-    if (!imp || !Readable(imp, 12)) { Log("Hash: no import table"); return; }
+    if (!imp || !Readable(imp, 12)) { LogErr("Hash: no import table"); return; }
     DWORD total = Be32(imp), strSize = Be32(imp + 4), strCount = Be32(imp + 8);
     if (total < 12 || total > 0x100000 || !Readable(imp, total) || strSize >= total) {
-        Log("Hash: odd import table (size %X)", total);
+        LogErr("Hash: odd import table (size %X)", total);
         return;
     }
 
@@ -410,16 +546,16 @@ static void ComputeModuleHash(XP_HASH* h, BOOL asBeforeWrites)
     // loader entry; +0x1C = image base, +0x58 = XEX header in memory.
     HANDLE krnl = NULL;
     PVOID  var  = NULL;
-    if (XexGetModuleHandle("xboxkrnl.exe", &krnl) != 0 || !krnl) { Log("Hash: no xboxkrnl handle"); return; }
-    if (XexGetProcedureAddress(krnl, 0x193, &var) != 0 || !var)  { Log("Hash: no XexExecutableModuleHandle"); return; }
-    if (!Readable(var, 4)) { Log("Hash: handle variable %08X not readable", (DWORD)var); return; }
+    if (XexGetModuleHandle("xboxkrnl.exe", &krnl) != 0 || !krnl) { LogErr("Hash: no xboxkrnl handle"); return; }
+    if (XexGetProcedureAddress(krnl, 0x193, &var) != 0 || !var)  { LogErr("Hash: no XexExecutableModuleHandle"); return; }
+    if (!Readable(var, 4)) { LogErr("Hash: handle variable %08X not readable", (DWORD)var); return; }
 
     BYTE* ldr = *(BYTE**)var;
-    if (!ldr || !Readable(ldr, 0x5C)) { Log("Hash: bad loader entry %08X", (DWORD)ldr); return; }
+    if (!ldr || !Readable(ldr, 0x5C)) { LogErr("Hash: bad loader entry %08X", (DWORD)ldr); return; }
     DWORD base = *(DWORD*)(ldr + 0x1C);
     BYTE* xex  = *(BYTE**)(ldr + 0x58);
     if (!xex || !Readable(xex, 0x18) || *(DWORD*)xex != 0x58455832) {   // 'XEX2'
-        Log("Hash: XEX header not found (%08X)", (DWORD)xex);
+        LogErr("Hash: XEX header not found (%08X)", (DWORD)xex);
         return;
     }
 
@@ -430,15 +566,15 @@ static void ComputeModuleHash(XP_HASH* h, BOOL asBeforeWrites)
     DWORD secFld  = *(DWORD*)(xex + 0x10);
     DWORD secOff  = (secFld >= (DWORD)xex) ? secFld - (DWORD)xex : secFld;
     if (secOff < 0x18 || secOff > 0x100000 || (hdrSize && secOff >= hdrSize)) {
-        Log("Hash: odd security field %08X (header %08X, size %X)", secFld, (DWORD)xex, hdrSize);
+        LogErr("Hash: odd security field %08X (header %08X, size %X)", secFld, (DWORD)xex, hdrSize);
         return;
     }
     BYTE* sec = xex + secOff;
-    if (!Readable(sec, 0x184)) { Log("Hash: security info %08X not readable", (DWORD)sec); return; }
+    if (!Readable(sec, 0x184)) { LogErr("Hash: security info %08X not readable", (DWORD)sec); return; }
     DWORD count = *(DWORD*)(sec + 0x180);
-    if (count == 0 || count > 0x10000) { Log("Hash: odd descriptor count %u", count); return; }
+    if (count == 0 || count > 0x10000) { LogErr("Hash: odd descriptor count %u", count); return; }
     BYTE* desc = sec + 0x184;                 // 0x18 bytes each: value + digest
-    if (!Readable(desc, count * 0x18)) { Log("Hash: descriptors not readable"); return; }
+    if (!Readable(desc, count * 0x18)) { LogErr("Hash: descriptors not readable"); return; }
 
     DWORD first = 0xFFFFFFFF, last = 0xFFFFFFFF;
     for (DWORD i = 0; i < count; i++) {
@@ -448,7 +584,7 @@ static void ComputeModuleHash(XP_HASH* h, BOOL asBeforeWrites)
             last = i;
         }
     }
-    if (first == 0xFFFFFFFF) { Log("Hash: no code section"); return; }
+    if (first == 0xFFFFFFFF) { LogErr("Hash: no code section"); return; }
 
     // Xenia's heap page size for the base address (used with the descriptor index)
     DWORD page = (base >= 0x90000000 && base < 0xA0000000) ? 0x1000 : 0x10000;
@@ -458,8 +594,8 @@ static void ComputeModuleHash(XP_HASH* h, BOOL asBeforeWrites)
     h->Start = base + first * page;
     h->End   = base + (last + 1) * page;
     h->PageSize = page; h->Descriptors = count; h->FirstCode = first; h->LastCode = last;
-    if (h->End <= h->Start || h->End - h->Start > 0x4000000) { Log("Hash: odd range %08X-%08X", h->Start, h->End); return; }
-    if (!Readable((void*)h->Start, h->End - h->Start)) { Log("Hash: range %08X-%08X not readable", h->Start, h->End); return; }
+    if (h->End <= h->Start || h->End - h->Start > 0x4000000) { LogErr("Hash: odd range %08X-%08X", h->Start, h->End); return; }
+    if (!Readable((void*)h->Start, h->End - h->Start)) { LogErr("Hash: range %08X-%08X not readable", h->Start, h->End); return; }
 
     BuildImportSubst(xex, hdrSize, base, desc, count, realPage, h);
     if (asBeforeWrites) {
@@ -635,9 +771,39 @@ typedef struct {
     char  Value[1100];
     DWORD Address;
     BOOL  HasAddress, HasValue, Active;
+    int   Line;                 // line of its [[patch.TYPE]], for error messages
 } XP_WRITE;
 
 static BYTE g_Data[2048];
+
+// ---- TOML errors: logged with file name and line number (always, also
+// with log = 0), at most 5 per file so a broken file can't flood the log ----
+static const char* g_TomlFile = "";
+static int         g_TomlErrors = 0;
+static DWORD       g_TomlTitle = 0;
+
+static void TomlError(int line, const char* fmt, ...)
+{
+    if (++g_TomlErrors > 5) {
+        if (g_TomlErrors == 6) LogErr("[%08X] TOML: more errors in %s not shown", g_TomlTitle, g_TomlFile);
+        return;
+    }
+    char msg[200];
+    va_list ap;
+    va_start(ap, fmt);
+    _vsnprintf(msg, sizeof(msg) - 1, fmt, ap);
+    va_end(ap);
+    msg[sizeof(msg) - 1] = 0;
+    const char* name = strrchr(g_TomlFile, '\\');
+    LogErr("[%08X] TOML error, %s line %d: %s", g_TomlTitle, name ? name + 1 : g_TomlFile, line, msg);
+}
+
+static BOOL KnownType(const char* t)
+{
+    static const char* types[] = { "be8", "be16", "be32", "be64", "f32", "f64", "string", "u16string", "array" };
+    for (int i = 0; i < 9; i++) if (!strcmp(t, types[i])) return TRUE;
+    return FALSE;
+}
 
 static void FlushWrite(XP_WRITE* w, DWORD titleId, const char* patchName, BOOL enabled,
                        int* writes, int* errors)
@@ -645,23 +811,30 @@ static void FlushWrite(XP_WRITE* w, DWORD titleId, const char* patchName, BOOL e
     if (!w->Active) return;
     w->Active = FALSE;
     if (!enabled) return;
-    if (!w->HasAddress || !w->HasValue) { (*errors)++; return; }
+    if (!KnownType(w->Type)) { (*errors)++; return; }          // reported at its section line
+    if (!w->HasAddress || !w->HasValue) {
+        TomlError(w->Line, "'%s': [[patch.%s]] without %s", patchName, w->Type,
+                  !w->HasAddress ? "address" : "value");
+        (*errors)++;
+        return;
+    }
 
     int len = EncodeValue(w->Type, w->Value, g_Data, sizeof(g_Data));
     if (len <= 0) {
-        Log("[%08X] '%s': bad %s value at %08X", titleId, patchName, w->Type, w->Address);
+        TomlError(w->Line, "'%s': bad %s value at %08X", patchName, w->Type, w->Address);
         (*errors)++;
         return;
     }
     BYTE* dst = (BYTE*)w->Address;
     if (!MmIsAddressValid(dst) || !MmIsAddressValid(dst + len - 1)) {
-        Log("[%08X] '%s': invalid address %08X", titleId, patchName, w->Address);
+        LogErr("[%08X] '%s': invalid address %08X (line %d)", titleId, patchName, w->Address, w->Line);
         (*errors)++;
         return;
     }
     UndoSave(dst, len);                 // original bytes, for the cache check / undo
     memcpy(dst, g_Data, len);
     FlushRange(dst, len);
+    TrackWrite(titleId, patchName, w->Address, len);
     (*writes)++;
 }
 
@@ -679,7 +852,7 @@ static void EndPatch(DWORD titleId, const char* name, int errorsAtStart, int err
         Log("[%08X] ON  '%s'", titleId, name);
         r->PatchesOk++;
     } else {
-        Log("[%08X] ON  '%s' - FAILED (%d errors)", titleId, name, errors - errorsAtStart);
+        LogErr("[%08X] ON  '%s' - FAILED (%d errors)", titleId, name, errors - errorsAtStart);
         r->PatchesFailed++;
     }
 }
@@ -736,8 +909,13 @@ static void ApplyToml(const char* path, const XP_EXEC_ID* exec, XP_RESULT* r, BO
     FILE* f = fopen(path, "rb");
     if (!f) return;
     DWORD size = (DWORD)fread(g_FileBuf, 1, XP_MAX_FILE, f);
+    BOOL tooBig = (size == XP_MAX_FILE && fgetc(f) != EOF);
     fclose(f);
     g_FileBuf[size] = 0;
+    if (tooBig) {                   // never cut a file silently
+        LogErr("[%08X] %s is bigger than %u KB - not applied", exec->TitleId, path, XP_MAX_FILE / 1024);
+        return;
+    }
 
     char patchName[96] = "";
     BOOL inPatch = FALSE, enabled = FALSE, topLevel = TRUE;
@@ -749,13 +927,23 @@ static void ApplyToml(const char* path, const XP_EXEC_ID* exec, XP_RESULT* r, BO
 
     UINT64 fileHashes[16]; int fileHashCount = 0;
     BOOL   inHashList = FALSE;
+    BOOL   inList = FALSE;          // other multi-line  key = [ ... ]
+    BOOL   inLongString = FALSE;    // key = """ ... """
+    int    lineNo = 0;
+    g_TomlFile = path; g_TomlErrors = 0; g_TomlTitle = exec->TitleId;
 
     char* line = g_FileBuf;
     while (*line) {
         char* next = line;
         while (*next && *next != '\n') next++;
         if (*next) *next++ = 0;
+        lineNo++;
 
+        if (inLongString) {
+            if (strstr(line, "\"\"\"")) inLongString = FALSE;
+            line = next;
+            continue;
+        }
         StripComment(line);
         char* s = Trim(line);
 
@@ -765,6 +953,12 @@ static void ApplyToml(const char* path, const XP_EXEC_ID* exec, XP_RESULT* r, BO
             line = next;
             continue;
         }
+        if (inList) {
+            if (strchr(s, ']')) inList = FALSE;
+            line = next;
+            continue;
+        }
+        if (!*s) { line = next; continue; }
 
         if (*s == '[') {
             if (!decided) {
@@ -795,14 +989,26 @@ static void ApplyToml(const char* path, const XP_EXEC_ID* exec, XP_RESULT* r, BO
                     memset(&w, 0, sizeof(w));
                     strncpy(w.Type, Trim(type), sizeof(w.Type) - 1);
                     w.Active = TRUE;
+                    w.Line = lineNo;
+                    if (!KnownType(w.Type))
+                        TomlError(lineNo, "unknown type [[patch.%s]] (be8/16/32/64, f32, f64, string, u16string, array)", w.Type);
+                } else {
+                    TomlError(lineNo, "section without closing ]]");
                 }
+            } else if (!strncmp(s, "[[patch.", 8)) {
+                TomlError(lineNo, "%.40s before the first [[patch]]", s);
+            } else {
+                TomlError(lineNo, "unknown section %.40s", s);
             }
         } else {
             char* eq = strchr(s, '=');
+            if (!eq) TomlError(lineNo, "not a 'key = value' line: %.40s", s);
             if (eq) {
                 *eq = 0;
                 char* key = Trim(s);
                 char* val = Trim(eq + 1);
+                if (!strncmp(val, "\"\"\"", 3) && !strstr(val + 3, "\"\"\"")) inLongString = TRUE;
+                else if (*val == '[' && !strchr(val, ']') && strcmp(key, "hash")) inList = TRUE;
 
                 if (topLevel) {
                     if (!strcmp(key, "hash")) {
@@ -825,6 +1031,8 @@ static void ApplyToml(const char* path, const XP_EXEC_ID* exec, XP_RESULT* r, BO
                         if (Unquote(val, patchName, sizeof(patchName)) < 0)
                             strncpy(patchName, val, sizeof(patchName) - 1);
                     } else if (!strcmp(key, "is_enabled")) {
+                        if (strncmp(val, "true", 4) && strncmp(val, "false", 5))
+                            TomlError(lineNo, "is_enabled must be true or false, not %.20s", val);
                         enabled = !strncmp(val, "true", 4);
                         if (enabled && skipFile) { r->PatchesSkipped++; enabled = FALSE; }
                         if (enabled) patchesOn++;
@@ -845,11 +1053,11 @@ static void ApplyToml(const char* path, const XP_EXEC_ID* exec, XP_RESULT* r, BO
                 n += _snprintf(list + n, sizeof(list) - n, "%s%08X%08X", k ? "," : "",
                                (DWORD)(fileHashes[k] >> 32), (DWORD)fileHashes[k]);
             list[sizeof(list) - 1] = 0;
-            Log("[%08X] %d enabled patches SKIPPED - file is for another game version "
+            LogErr("[%08X] %d enabled patches SKIPPED - file is for another game version "
                 "(file hash %s) (%s)", exec->TitleId, r->PatchesSkipped - skippedBefore,
                 fileHashCount ? list : "none", path);
         } else {
-            Log("[%08X] %d enabled patches SKIPPED - %s does not match (%s)", exec->TitleId,
+            LogErr("[%08X] %d enabled patches SKIPPED - %s does not match (%s)", exec->TitleId,
                 r->PatchesSkipped - skippedBefore, tuMismatch ? "TU" : "media_id", path);
         }
     } else {
@@ -875,9 +1083,9 @@ static XNOTIFYQUEUEUICUSTOM GetNotifyFn()
     if (!fn) {
         HANDLE xam = NULL;
         DWORD st = XexGetModuleHandle("xam.xex", &xam);
-        if (st != 0 || !xam) { Log("Notify: xam.xex handle failed (%08X)", st); return NULL; }
+        if (st != 0 || !xam) { LogErr("Notify: xam.xex handle failed (%08X)", st); return NULL; }
         st = XexGetProcedureAddress(xam, 656, (PVOID*)&fn);
-        if (st != 0 || !fn) { Log("Notify: ordinal 656 not found (%08X)", st); fn = NULL; return NULL; }
+        if (st != 0 || !fn) { LogErr("Notify: ordinal 656 not found (%08X)", st); fn = NULL; return NULL; }
         Log("Notify: XNotifyQueueUICustom at %08X", (DWORD)fn);
     }
     return fn;
@@ -910,20 +1118,53 @@ static void Notify(const char* text)
     // no 0x2 flag: not a system thread, so it belongs to the running title
     ExCreateThread(&h, 0, &tid, (PVOID)XapiThreadStartup,
                    (LPTHREAD_START_ROUTINE)NotifyThread, NULL, CREATE_SUSPENDED);
-    if (!h) { Log("Notify: could not create thread"); return; }
+    if (!h) { LogErr("Notify: could not create thread"); return; }
     ResumeThread(h);
     CloseHandle(h);
 }
 
+// Notifications are queued and shown by the main loop (no Sleep in the
+// patching path): one at a time, at least 3 s apart, only while the title
+// that queued them is still running.
+#define XP_MAX_NOTE 4
+typedef struct { DWORD Due; DWORD TitleId; char Text[100]; } XP_NOTE;
+static XP_NOTE g_Notes[XP_MAX_NOTE];
+static int     g_NoteCount = 0;
+static DWORD   g_NextNoteTime = 0;
+
+static void NotifyLater(DWORD titleId, DWORD delayMs, const char* text)
+{
+    Log("Notification: %s", text);
+    if (!g_Cfg.Notify || g_NoteCount >= XP_MAX_NOTE) return;
+    XP_NOTE* n = &g_Notes[g_NoteCount++];
+    n->Due = GetTickCount() + delayMs;
+    n->TitleId = titleId;
+    strncpy(n->Text, text, sizeof(n->Text) - 1);
+    n->Text[sizeof(n->Text) - 1] = 0;
+}
+
+// called from the main loop
+static void NotifyTick(DWORD title)
+{
+    if (g_NoteCount == 0) return;
+    DWORD now = GetTickCount();
+    if ((LONG)(now - g_Notes[0].Due) < 0 || (LONG)(now - g_NextNoteTime) < 0) return;
+    if (g_Notes[0].TitleId == title) {
+        Notify(g_Notes[0].Text);
+        g_NextNoteTime = now + 3000;
+    }
+    memmove(&g_Notes[0], &g_Notes[1], (--g_NoteCount) * sizeof(XP_NOTE));
+}
+
 // --------------------------------------------------------------------------
-// Hash cache: Hdd:\Patches\XPatch360.cache, one line per game version:
+// Hash cache: Hdd:\Patches\XPatch360\XPatch360.cache, one line per game version:
 //   <TitleId> <Version> <BaseVersion> <MediaId> <hash>
 // With a cached hash the patches are written at once (no time lost while the
 // game starts, so early patches like "Skip Legal Screens" still work); the
 // hash is then checked against the memory as it was before the writes, and
 // everything is undone if it does not match.
 // --------------------------------------------------------------------------
-#define XP_CACHE XP_DIR "XPatch360.cache"
+#define XP_CACHE XP_DATA "XPatch360.cache"
 typedef struct { DWORD TitleId, Version, BaseVersion, MediaId; UINT64 Hash; } XP_CACHE_ENTRY;
 #define XP_MAX_CACHE 256
 static XP_CACHE_ENTRY g_Cache[XP_MAX_CACHE];
@@ -1056,7 +1297,7 @@ static void ApplyPatches(const XP_EXEC_ID* exec)
                     (DWORD)(mh.XeniaStyle >> 32), (DWORD)mh.XeniaStyle);
             } else if (real.Ok) {
                 // the cache was wrong: undo everything and decide again
-                Log("[%08X] cached hash %08X%08X is outdated, real %08X%08X - %d writes undone",
+                LogErr("[%08X] cached hash %08X%08X is outdated, real %08X%08X - %d writes undone",
                     exec->TitleId, (DWORD)(mh.XeniaStyle >> 32), (DWORD)mh.XeniaStyle,
                     (DWORD)(real.XeniaStyle >> 32), (DWORD)real.XeniaStyle, g_UndoCount);
                 UndoAll();
@@ -1077,7 +1318,7 @@ static void ApplyPatches(const XP_EXEC_ID* exec)
             Log("[%08X] module hash %08X%08X (computed, cached for next time)", exec->TitleId,
                 (DWORD)(mh.XeniaStyle >> 32), (DWORD)mh.XeniaStyle);
         } else {
-            Log("[%08X] module hash not available - using the TU check of v1.0", exec->TitleId);
+            LogErr("[%08X] module hash not available - using the TU check of v1.0", exec->TitleId);
         }
         ApplyAllFiles(exec, &mh, &r);
         if (mh.Ok) {
@@ -1106,12 +1347,486 @@ static void ApplyPatches(const XP_EXEC_ID* exec)
         _snprintf(msg, sizeof(msg), "XPatch360: %d patch%s skipped - game version doesn't match",
                   r.PatchesSkipped, r.PatchesSkipped == 1 ? "" : "es");
     msg[sizeof(msg) - 1] = 0;
+    if (g_Conflicts) {
+        int n = (int)strlen(msg);
+        _snprintf(msg + n, sizeof(msg) - n, " - %d conflict%s, see log", g_Conflicts, g_Conflicts == 1 ? "" : "s");
+        msg[sizeof(msg) - 1] = 0;
+    }
 
-    // Patching is done already; wait a moment so the toast isn't lost
-    // while the game is still bringing up its first screen.
-    Sleep(3000);
-    Notify(msg);
-    Log("Notification: %s", msg);
+    // Patching is done already; show it a moment later so the toast isn't
+    // lost while the game is still bringing up its first screen.
+    NotifyLater(exec->TitleId, 3000, msg);
+}
+
+// --------------------------------------------------------------------------
+// Debug mode (debug = 1 in the ini): memory dumps
+// Hdd:\Patches\XPatch360\XPatch360.dump, one line per dump:
+//   TITLEID ADDRESS LENGTH [DELAY]   range to the log (LENGTH up to 1000 hex) or to
+//                                    Hdd:\Patches\XPatch360\<TITLEID>_<ADDRESS>.bin (bigger);
+//                                    ADDRESS can be *PTR+OFF (pointer read at dump time)
+//   TITLEID code [DELAY]             the game's whole image -> <TITLEID>_TU<n>_code.bin
+//   next code [DELAY]                same, for the next game that starts
+// DELAY = seconds after the game started (live bytes); no delay = right after
+// patching, with XPatch360's own writes shown as the original bytes.
+// "code" lines are done once and then removed from the file (the Aurora
+// script writes them); address lines stay until removed by hand.
+// Delayed dumps are run by the main loop, nothing waits.
+// --------------------------------------------------------------------------
+#define XP_DUMP      XP_DATA "XPatch360.dump"
+#define XP_DUMP_MAX  0x1000
+#define XP_MAX_JOBS  32
+
+typedef struct {
+    DWORD TitleId, Due, Delay;
+    BOOL  Indirect, Code, OneShot;
+    DWORD Addr, Off, Len;
+    char  Line[96];          // the line as written, to remove a one-shot line
+} XP_JOB;
+static XP_JOB g_Jobs[XP_MAX_JOBS];
+static int    g_JobCount = 0;
+static int    g_JobLogDumps = 0;   // log dumps done for this title (one notification at the end)
+static DWORD  g_JobVersion = 0;
+
+// dashboards and system apps are not "the next game"
+static BOOL IsGameTitle(DWORD t)
+{
+    DWORD hi = t >> 16;
+    return t != 0 && hi != 0xFFFE && hi != 0xFFFF && hi != 0xF5D1;
+}
+
+// base and size of the running title's image (from its XEX header)
+static BOOL GetTitleImage(DWORD* base, DWORD* size)
+{
+    HANDLE krnl = NULL; PVOID var = NULL;
+    if (XexGetModuleHandle("xboxkrnl.exe", &krnl) != 0 || !krnl) return FALSE;
+    if (XexGetProcedureAddress(krnl, 0x193, &var) != 0 || !var || !Readable(var, 4)) return FALSE;
+    BYTE* ldr = *(BYTE**)var;
+    if (!ldr || !Readable(ldr, 0x5C)) return FALSE;
+    BYTE* xex = *(BYTE**)(ldr + 0x58);
+    if (!xex || !Readable(xex, 0x18) || *(DWORD*)xex != 0x58455832) return FALSE;
+    DWORD secFld = *(DWORD*)(xex + 0x10);
+    DWORD secOff = (secFld >= (DWORD)xex) ? secFld - (DWORD)xex : secFld;
+    if (secOff < 0x18 || secOff > 0x100000 || !Readable(xex + secOff, 0x114)) return FALSE;
+    *base = *(DWORD*)(ldr + 0x1C);
+    *size = *(DWORD*)(xex + secOff + 0x04);          // security info: image size
+    return *size != 0 && *size <= 0x4000000;
+}
+
+
+// drop the first line equal to `text` from the dump file
+static void RemoveDumpLine(const char* text)
+{
+    FILE* f = fopen(XP_DUMP, "rb");
+    if (!f) return;
+    DWORD n = (DWORD)fread(g_FileBuf, 1, XP_MAX_FILE, f);
+    fclose(f);
+    g_FileBuf[n] = 0;
+    f = fopen(XP_DUMP, "wb");
+    if (!f) return;
+    BOOL done = FALSE;
+    char* p = g_FileBuf;
+    while (*p) {
+        char* e = p; while (*e && *e != '\n') e++;
+        char* next = *e ? e + 1 : e;
+        char save = *e; *e = 0;
+        char line[96]; strncpy(line, p, sizeof(line) - 1); line[sizeof(line) - 1] = 0;
+        *e = save;
+        int L = (int)strlen(line); while (L && (line[L - 1] == '\r' || line[L - 1] == ' ')) line[--L] = 0;
+        if (!done && !strcmp(line, text)) done = TRUE;
+        else fwrite(p, 1, next - p, f);
+        p = next;
+    }
+    fclose(f);
+}
+
+// .bin dumps are written by a separate low-priority thread, so the main loop
+// (patching, notifications, the next title start) never waits for the hard
+// disk. One file at a time; the main loop logs and notifies when it is done.
+typedef struct { DWORD TitleId, Addr, Len; BOOL OneShot; char Name[48]; char Line[96]; } XP_FILEDUMP;
+#define XP_MAX_FILEDUMPS 4
+static XP_FILEDUMP   g_FdQueue[XP_MAX_FILEDUMPS];
+static int           g_FdQueued = 0;
+static XP_FILEDUMP   g_Fd;                       // the one being written
+static volatile LONG g_FdState = 0;              // 0 idle, 1 writing, 2 finished
+static DWORD         g_FdReadable = 0;
+static BOOL          g_FdOk = FALSE;
+// our own writes at the time the dump started: shown as the original bytes
+static XP_UNDO       g_FdUndo[XP_MAX_UNDO];
+static BYTE          g_FdUndoData[sizeof(g_UndoData)];
+static int           g_FdUndoCount = 0;
+
+static void __cdecl FileDumpThread(void*)
+{
+    char path[80];
+    _snprintf(path, sizeof(path), XP_DATA "%s", g_Fd.Name);
+    path[sizeof(path) - 1] = 0;
+    g_FdReadable = 0;
+    g_FdOk = FALSE;
+    FILE* o = fopen(path, "wb");
+    if (o) {
+        static BYTE page[0x1000];
+        DWORD addr = g_Fd.Addr, len = g_Fd.Len;
+        for (DWORD off = 0; off < len; off += 0x1000) {
+            DWORD a = addr + off, n = (len - off < 0x1000) ? len - off : 0x1000;
+            if (MmIsAddressValid((PVOID)a)) {
+                memcpy(page, (void*)a, n);
+                for (int u = 0; u < g_FdUndoCount; u++)
+                    for (DWORD k = 0; k < g_FdUndo[u].Len; k++) {
+                        DWORD b = g_FdUndo[u].Addr + k;
+                        if (b >= a && b < a + n) page[b - a] = g_FdUndoData[g_FdUndo[u].Off + k];
+                    }
+                g_FdReadable += n;
+            } else {
+                memset(page, 0, n);
+            }
+            fwrite(page, 1, n, o);
+        }
+        fclose(o);
+        g_FdOk = TRUE;
+    }
+    InterlockedExchange(&g_FdState, 2);
+}
+
+static void QueueFileDump(DWORD titleId, const char* name, DWORD addr, DWORD len,
+                          BOOL oneShot, const char* line)
+{
+    if (g_FdQueued >= XP_MAX_FILEDUMPS) { LogErr("[%08X] DUMP %s: too many dumps queued", titleId, name); return; }
+    XP_FILEDUMP* d = &g_FdQueue[g_FdQueued++];
+    memset(d, 0, sizeof(*d));
+    d->TitleId = titleId; d->Addr = addr; d->Len = (len > 0x4000000) ? 0x4000000 : len;
+    d->OneShot = oneShot;
+    strncpy(d->Name, name, sizeof(d->Name) - 1);
+    if (line) strncpy(d->Line, line, sizeof(d->Line) - 1);
+}
+
+// main loop: report a finished dump, start the next one
+static void FileDumpTick()
+{
+    if (g_FdState == 2) {
+        if (g_FdOk) {
+            Log("[%08X] DUMP %08X+%X -> " XP_DATA "%s (%u KB readable, original bytes)",
+                g_Fd.TitleId, g_Fd.Addr, g_Fd.Len, g_Fd.Name, g_FdReadable / 1024);
+            if (g_Fd.OneShot) RemoveDumpLine(g_Fd.Line);
+            char msg[64];
+            _snprintf(msg, sizeof(msg), "XPatch360: dump done (%u MB)", (g_Fd.Len + 0x80000) >> 20);
+            msg[sizeof(msg) - 1] = 0;
+            NotifyLater(g_Fd.TitleId, 0, msg);
+        } else {
+            LogErr("[%08X] DUMP: cannot create " XP_DATA "%s", g_Fd.TitleId, g_Fd.Name);
+        }
+        g_FdState = 0;
+    }
+    if (g_FdState != 0 || g_FdQueued == 0) return;
+
+    g_Fd = g_FdQueue[0];
+    memmove(&g_FdQueue[0], &g_FdQueue[1], (--g_FdQueued) * sizeof(XP_FILEDUMP));
+    // snapshot of our writes (only if they belong to this title)
+    g_FdUndoCount = 0;
+    if (XamGetCurrentTitleId() == g_Fd.TitleId) {
+        memcpy(g_FdUndo, g_Undo, g_UndoCount * sizeof(XP_UNDO));
+        memcpy(g_FdUndoData, g_UndoData, g_UndoUsed);
+        g_FdUndoCount = g_UndoCount;
+    }
+    g_FdState = 1;
+    HANDLE h = NULL; DWORD tid = 0;
+    ExCreateThread(&h, 0x4000, &tid, (PVOID)XapiThreadStartup,
+                   (LPTHREAD_START_ROUTINE)FileDumpThread, NULL, 0x2 | CREATE_SUSPENDED);
+    if (!h) { LogErr("[%08X] DUMP: could not start the dump thread", g_Fd.TitleId); g_FdState = 0; return; }
+    SetThreadPriority(h, THREAD_PRIORITY_LOWEST);   // the game comes first
+    ResumeThread(h);
+    CloseHandle(h);
+}
+
+static void RunJob(XP_JOB* j)
+{
+    static BYTE buf[XP_DUMP_MAX];
+    static BYTE changed[XP_DUMP_MAX];
+    BOOL live = (j->Delay != 0);
+
+    if (j->Code) {
+        DWORD base, size;
+        if (!GetTitleImage(&base, &size)) { LogErr("[%08X] DUMP code: image not found", j->TitleId); return; }
+        char name[48];
+        _snprintf(name, sizeof(name), "%08X_TU%d_code.bin", j->TitleId, TuFromVersion(g_JobVersion));
+        name[sizeof(name) - 1] = 0;
+        QueueFileDump(j->TitleId, name, base, size, j->OneShot, j->Line);
+        return;
+    }
+
+    DWORD addr = j->Addr;
+    if (j->Indirect) {
+        if (!Readable((void*)addr, 4)) { LogErr("[%08X] DUMP *%08X: pointer not readable", j->TitleId, addr); return; }
+        addr = *(DWORD*)addr + j->Off;
+    } else {
+        addr += j->Off;
+    }
+    if (j->Len > XP_DUMP_MAX) {
+        char name[48];
+        _snprintf(name, sizeof(name), "%08X_%08X.bin", j->TitleId, addr & ~0xFFFu);
+        name[sizeof(name) - 1] = 0;
+        QueueFileDump(j->TitleId, name, addr & ~0xFFFu, j->Len, FALSE, NULL);
+        return;
+    }
+    addr &= ~3u;
+    DWORD len = j->Len;
+    g_LogDefer = TRUE;
+    if (!Readable((void*)addr, len)) {
+        LogErr("[%08X] DUMP %08X+%X: not readable", j->TitleId, addr, len);
+        LogFlush();
+        return;
+    }
+    memcpy(buf, (void*)addr, len);
+    memset(changed, 0, len);
+    if (!live) {
+        // put back the original bytes of our own writes
+        for (int u = 0; u < g_UndoCount; u++)
+            for (DWORD k = 0; k < g_Undo[u].Len; k++) {
+                DWORD a = g_Undo[u].Addr + k;
+                if (a >= addr && a < addr + len) {
+                    buf[a - addr] = g_UndoData[g_Undo[u].Off + k];
+                    changed[a - addr] = 1;
+                }
+            }
+        Log("[%08X] DUMP %08X+%X (original bytes; * = line XPatch360 wrote to)", j->TitleId, addr, len);
+    } else if (j->Indirect) {
+        Log("[%08X] DUMP *%08X+%X = %08X+%X at %us (live bytes)", j->TitleId, j->Addr, j->Off, addr, len, j->Delay);
+    } else {
+        Log("[%08X] DUMP %08X+%X at %us (live bytes)", j->TitleId, addr, len, j->Delay);
+    }
+    for (DWORD o = 0; o < len; o += 16) {
+        char hex[64]; int n = 0; BOOL mark = FALSE;
+        for (DWORD k = 0; k < 16 && o + k < len; k++) {
+            n += _snprintf(hex + n, sizeof(hex) - n, "%02X", buf[o + k]);
+            if ((k & 3) == 3) hex[n++] = ' ';
+            if (changed[o + k]) mark = TRUE;
+            hex[n] = 0;
+        }
+        if (n > 0 && hex[n - 1] == ' ') hex[--n] = 0;
+        Log("%c %08X: %s", mark ? '*' : ' ', addr + o, hex);
+    }
+    LogFlush();
+    g_JobLogDumps++;
+}
+
+// at a title start (debug mode only): read the dump file, run the immediate
+// dumps now and keep the delayed ones for DumpTick
+static void DumpStart(const XP_EXEC_ID* exec)
+{
+    g_JobCount = 0;
+    g_JobLogDumps = 0;
+    g_JobVersion = exec->Version;
+    if (!g_Cfg.Debug) return;
+    FILE* f = fopen(XP_DUMP, "rb");
+    if (!f) return;
+    DWORD now = GetTickCount(), firstDelay = 0;
+    char line[160];
+    while (fgets(line, sizeof(line), f) && g_JobCount < XP_MAX_JOBS) {
+        int L = (int)strlen(line);
+        while (L && (line[L - 1] == '\r' || line[L - 1] == '\n' || line[L - 1] == ' ')) line[--L] = 0;
+        char* s = line;
+        while (*s == ' ' || *s == '\t') s++;
+        if (*s == '#' || *s == ';' || !*s) continue;
+
+        XP_JOB j; memset(&j, 0, sizeof(j));
+        strncpy(j.Line, line, sizeof(j.Line) - 1);
+        char* e;
+        if (!_strnicmp(s, "next", 4)) {
+            if (!IsGameTitle(exec->TitleId)) continue;
+            s += 4;
+        } else {
+            DWORD tid = strtoul(s, &e, 16);
+            if (e == s || tid != exec->TitleId) continue;
+            s = e;
+        }
+        while (*s == ' ' || *s == '\t') s++;
+        if (!_strnicmp(s, "code", 4)) {
+            j.Code = TRUE; j.OneShot = TRUE; s += 4;
+        } else {
+            j.Indirect = (*s == '*');
+            if (j.Indirect) s++;
+            j.Addr = strtoul(s, &e, 16); s = e;
+            if (*s == '+') { j.Off = strtoul(s + 1, &e, 16); s = e; }
+            j.Len = strtoul(s, &e, 16); s = e;
+            if (j.Len == 0) continue;
+        }
+        j.Delay   = strtoul(s, &e, 10);
+        j.TitleId = exec->TitleId;
+        j.Due     = now + j.Delay * 1000;
+        if (j.Delay && (!firstDelay || j.Delay < firstDelay)) firstDelay = j.Delay;
+        g_Jobs[g_JobCount++] = j;
+    }
+    fclose(f);
+
+    // the immediate ones now (in file order), delayed ones stay queued
+    int keep = 0;
+    for (int i = 0; i < g_JobCount; i++) {
+        if (g_Jobs[i].Delay == 0) RunJob(&g_Jobs[i]);
+        else g_Jobs[keep++] = g_Jobs[i];
+    }
+    g_JobCount = keep;
+    if (firstDelay) {
+        char msg[64];
+        _snprintf(msg, sizeof(msg), "XPatch360: dump in %u s", firstDelay);
+        msg[sizeof(msg) - 1] = 0;
+        NotifyLater(exec->TitleId, 0, msg);
+    } else if (g_JobLogDumps) {
+        NotifyLater(exec->TitleId, 0, "XPatch360: dump written to the log");
+    }
+}
+
+// called from the main loop: run the delayed dumps that are due
+static void DumpTick(DWORD title)
+{
+    if (g_JobCount == 0) return;
+    DWORD now = GetTickCount();
+    int keep = 0;
+    for (int i = 0; i < g_JobCount; i++) {
+        XP_JOB* j = &g_Jobs[i];
+        if (j->TitleId != title) continue;                 // game left: drop it
+        if ((LONG)(now - j->Due) >= 0) RunJob(j);
+        else g_Jobs[keep++] = *j;
+    }
+    g_JobCount = keep;
+    if (g_JobCount == 0 && g_JobLogDumps) {
+        NotifyLater(title, 0, "XPatch360: dump written to the log");
+        g_JobLogDumps = 0;
+    }
+}
+
+
+// --------------------------------------------------------------------------
+// Early patching (early_patch = 1): hook on xboxkrnl #416 XexStartExecutable.
+// It runs after the title's XEX, its title update and its imports are loaded and
+// BEFORE the title's main thread is created. The hook itself does almost nothing
+// (the old title / Aurora is still alive, the loader lock is held): it points the
+// title's entry (ldr+0x3C) at EpEntry. The thread starts in xam's title setup, then
+// calls EpEntry, which waits (max 5 s) until the main loop has patched - the title's
+// thread has no Hdd: of its own, so the main loop does the file work as always.
+// Init-time settings (resolution etc.) can be patched this way. If anything goes
+// wrong the main loop simply patches the normal way.
+// --------------------------------------------------------------------------
+static DWORD          g_EpTarget = 0;           // XexStartExecutable
+static volatile DWORD g_EpRedirected = 0;       // the hook redirected this title's entry
+static volatile DWORD g_EpTick = 0;             // ...at this time
+static XP_EXEC_ID     g_EpExec;                 // copy of the title's execution info
+
+// the 4 instructions we replace (kernel 17559): mflr r12 / bl __savegprlr_28 /
+// stwu r1,-128(r1) / mr r28,r3
+static const DWORD g_EpExpect[4] = { 0x7D8802A6, 0x48000001, 0x9421FF80, 0x7C7C1B78 };
+
+typedef DWORD (*XP_START_FN)(DWORD);
+
+// the replaced instructions + a jump back, written at install time
+static void __declspec(naked) EpTrampoline()
+{
+    __emit(0x60000000); __emit(0x60000000); __emit(0x60000000); __emit(0x60000000);
+    __emit(0x60000000); __emit(0x60000000); __emit(0x60000000); __emit(0x60000000);
+    __emit(0x60000000); __emit(0x60000000); __emit(0x60000000); __emit(0x60000000);
+}
+
+static volatile DWORD g_EpOrigEntry = 0;        // the title's real entry point
+static volatile DWORD g_EpAtEntry = 0;          // this title waits at its entry
+static volatile DWORD g_EpRelease = 0;          // main loop: this title is patched, go
+static volatile DWORD g_EpEntryTick = 0;
+
+typedef DWORD (*XP_ENTRY_FN)(DWORD, DWORD, DWORD, DWORD);
+
+// on the title's main thread, before the title's first instruction
+static DWORD EpEntry(DWORD a, DWORD b, DWORD c, DWORD d)
+{
+    DWORD orig = g_EpOrigEntry;
+    DWORD t = g_EpExec.TitleId;
+    g_EpEntryTick = GetTickCount();
+    g_EpAtEntry = t;
+    while (g_EpRelease != t && GetTickCount() - g_EpEntryTick < 5000)
+        Sleep(1);
+    return ((XP_ENTRY_FN)(void*)orig)(a, b, c, d);
+}
+
+// runs on the loader's thread, before the title starts: no file access, no
+// heavy work here - only reads a few fields and redirects the entry point.
+static void EarlyLook()
+{
+    if (!g_Cfg.EarlyPatch) return;            // turned off in Aurora: the hook stays, does nothing
+    HANDLE krnl = NULL; PVOID var = NULL;
+    if (XexGetModuleHandle("xboxkrnl.exe", &krnl) != 0 || !krnl) return;
+    if (XexGetProcedureAddress(krnl, 0x193, &var) != 0 || !var || !Readable(var, 4)) return;
+    BYTE* ldr = *(BYTE**)var;                 // XexExecutableModuleHandle: the new title
+    if (!ldr || !Readable(ldr, 0x5C)) return;
+    BYTE* xex = *(BYTE**)(ldr + 0x58);
+    if (!xex || !Readable(xex, 0x18) || *(DWORD*)xex != 0x58455832) return;   // 'XEX2'
+    BYTE* ei = FindOptHeader(xex, 0, 0x00040006);                             // execution info
+    if (!ei || !Readable(ei, sizeof(XP_EXEC_ID))) return;
+    const XP_EXEC_ID* id = (const XP_EXEC_ID*)ei;
+    if (!IsGameTitle(id->TitleId)) return;    // Aurora / dashboard: left alone
+
+    DWORD* pEntry = (DWORD*)(ldr + 0x3C);
+    DWORD  e = *pEntry;
+    DWORD  mine = (DWORD)(void*)EpEntry;
+    if (!e || e == mine) return;              // never twice
+    memcpy(&g_EpExec, id, sizeof(g_EpExec));
+    g_EpAtEntry = 0; g_EpRelease = 0;         // a new start
+    g_EpOrigEntry = e;
+    g_EpTick = GetTickCount();
+    *pEntry = mine;
+    g_EpRedirected = id->TitleId;
+}
+
+static DWORD EpHook(DWORD arg)
+{
+    EarlyLook();
+    return ((XP_START_FN)(void*)EpTrampoline)(arg);
+}
+
+static void EpWrite(DWORD* at, const DWORD* words, int n)
+{
+    for (int i = 0; i < n; i++) at[i] = words[i];
+    FlushRange((BYTE*)at, n * 4);
+}
+
+static BOOL g_EpInstallTried = FALSE;
+
+static void InstallEarlyHook()
+{
+    if (g_EpInstallTried) return;                  // once per boot (also when turned on later)
+    g_EpInstallTried = TRUE;
+    HANDLE krnl = NULL; PVOID p = NULL;
+    if (XexGetModuleHandle("xboxkrnl.exe", &krnl) != 0 || !krnl ||
+        XexGetProcedureAddress(krnl, 416, &p) != 0 || !p || !Readable(p, 16)) {
+        LogErr("Early patching: XexStartExecutable not found - turned off");
+        return;
+    }
+    DWORD* f = (DWORD*)p;
+    BOOL ok = f[0] == g_EpExpect[0] && (f[1] & 0xFC000003) == g_EpExpect[1] &&
+              f[2] == g_EpExpect[2] && f[3] == g_EpExpect[3];
+    if (!ok) {
+        LogErr("Early patching: XexStartExecutable at %08X is not as expected (%08X %08X %08X %08X) - turned off",
+               (DWORD)f, f[0], f[1], f[2], f[3]);
+        return;
+    }
+    // where the original "bl __savegprlr_28" goes
+    LONG rel = (LONG)(f[1] & 0x03FFFFFC); if (rel & 0x02000000) rel -= 0x04000000;
+    DWORD save = (DWORD)f + 4 + rel;
+    DWORD back = (DWORD)f + 16;
+    DWORD hook = (DWORD)(void*)EpHook;
+
+    DWORD tramp[11] = {
+        0x7D8802A6,                                   // mflr r12
+        0x3D600000 | (save >> 16), 0x616B0000 | (save & 0xFFFF),
+        0x7D6903A6, 0x4E800421,                       // mtctr r11 / bctrl  (__savegprlr_28)
+        0x9421FF80,                                   // stwu r1,-128(r1)
+        0x7C7C1B78,                                   // mr r28,r3
+        0x3D600000 | (back >> 16), 0x616B0000 | (back & 0xFFFF),
+        0x7D6903A6, 0x4E800420                        // mtctr r11 / bctr  -> original + 16
+    };
+    DWORD jump[4] = {
+        0x3D600000 | (hook >> 16), 0x616B0000 | (hook & 0xFFFF),
+        0x7D6903A6, 0x4E800420                        // -> EpHook
+    };
+    EpWrite((DWORD*)(void*)EpTrampoline, tramp, 11);
+    EpWrite(f, jump, 4);
+    g_EpTarget = (DWORD)f;
+    Log("Early patching on (hook on XexStartExecutable at %08X)", (DWORD)f);
 }
 
 // --------------------------------------------------------------------------
@@ -1120,21 +1835,80 @@ static void ApplyPatches(const XP_EXEC_ID* exec)
 static void __cdecl MainThread(void*)
 {
     if (!WaitForHdd()) return;   // no hard disk -> nothing to patch from
-    Log("XPatch360 v" XPATCH_VERSION " started");
+    LoadSettings();
+    TrimLog();
+    g_LogError = TRUE;           // the start line is always written
+    Log("XPatch360 v" XPATCH_VERSION " started%s", g_Cfg.Debug ? " - DEBUG MODE" : "");
+    g_LogError = FALSE;
+    Log("Settings: notify %d, log %s, log_max_kb %u, early_patch %d, debug %d",
+        g_Cfg.Notify, g_Cfg.FullLog ? "full" : "errors only", g_Cfg.LogMaxKb, g_Cfg.EarlyPatch, g_Cfg.Debug);
     g_HashWorks = HashSelfTest();
     CacheLoad();                 // read once now, not while a game is starting
+    if (g_Cfg.EarlyPatch) InstallEarlyHook();
 
     DWORD lastTitle = 0;
+    int iniTick = 0;
+    FILETIME iniTime = { 0, 0 };
     while (g_Running) {
         DWORD title = XamGetCurrentTitleId();
         if (title != lastTitle) {
             lastTitle = title;
+            g_JobCount = 0;              // dumps of the previous game: dropped
 
             XP_EXEC_ID* exec = NULL;
             if (XamGetExecutionId((PVOID*)&exec) == 0 && exec && exec->TitleId == title) {
                 Log("Title %08X started (Version %08X, Base %08X, Media %08X)",
                     exec->TitleId, exec->Version, exec->BaseVersion, exec->MediaId);
-                ApplyPatches(exec);
+                // Early patching: the title id changes while xam is still setting the
+                // title up, before the title's entry. If the hook redirected this title,
+                // wait until its thread stands at the entry, patch, then let it go.
+                BOOL early = FALSE;
+                DWORD waited = 0;
+                if (g_EpTarget && g_EpRedirected == exec->TitleId) {
+                    DWORD t0 = GetTickCount();
+                    while (g_EpAtEntry != exec->TitleId && GetTickCount() - t0 < 5000)
+                        Sleep(1);
+                    waited = GetTickCount() - t0;
+                    early = (g_EpAtEntry == exec->TitleId);
+                    if (!early)
+                        LogErr("[%08X] early patching: the game did not reach its entry in %u ms - patched the normal way",
+                            exec->TitleId, waited);
+                } else if (g_EpTarget && g_Cfg.EarlyPatch && IsGameTitle(exec->TitleId)) {
+                    LogErr("[%08X] early patching: the hook did not see this game - patched the normal way",
+                        exec->TitleId);
+                }
+                UndoReset();             // no stale entries from the last game
+                ApplyPatches(exec);      // first: every millisecond counts here
+                g_EpRelease = exec->TitleId;                 // the title may run now
+                g_EpRedirected = 0;
+                if (early) {
+                    DWORD held = GetTickCount() - g_EpEntryTick;
+                    Log("[%08X] early patching: patched before the game's first instruction (the game waited %u ms)",
+                        exec->TitleId, held);
+                }
+                LoadSettings();          // then re-read the ini (changes made in Aurora)
+                if (g_Cfg.EarlyPatch && !g_EpTarget) InstallEarlyHook();   // turned on without a reboot
+                DumpStart(exec);
+            }
+        }
+        DumpTick(title);
+        FileDumpTick();
+        NotifyTick(title);
+        // the ini changed (Aurora Settings): read it now, not only at the next game start,
+        // so early_patch is right already for the game started next. Only while no game
+        // runs (Aurora / dashboard), one check per second; nothing at all during a game.
+        if (!IsGameTitle(title) && ++iniTick >= 200) {
+            iniTick = 0;
+            WIN32_FILE_ATTRIBUTE_DATA fa;
+            if (GetFileAttributesEx(XP_INI, GetFileExInfoStandard, &fa) &&
+                (fa.ftLastWriteTime.dwLowDateTime != iniTime.dwLowDateTime ||
+                 fa.ftLastWriteTime.dwHighDateTime != iniTime.dwHighDateTime)) {
+                BOOL first = (iniTime.dwLowDateTime == 0 && iniTime.dwHighDateTime == 0);
+                iniTime = fa.ftLastWriteTime;
+                if (!first) {
+                    LoadSettings();
+                    if (g_Cfg.EarlyPatch && !g_EpTarget) InstallEarlyHook();
+                }
             }
         }
         Sleep(5);   // poll often: the earlier we patch, the fewer init-time misses

@@ -1,0 +1,6 @@
+# XPatch360 converter fix - Call of Duty 4: Modern Warfare (all versions)
+# skip = true: the converter does not convert any Xenia patch file of this title id.
+# Reason: the game already runs at 60 FPS on a console, nothing to gain; the native 720p patch
+# fails on a real console ("error: out of memory").
+title_id = "415607E6"
+skip = true

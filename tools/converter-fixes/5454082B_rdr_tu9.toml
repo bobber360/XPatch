@@ -1,0 +1,27 @@
+# XPatch360 converter fix - Red Dead Redemption TU9
+# Applied by Convert-XeniaPatches.ps1 (v1.2) to the Xenia file with this title ID and hash.
+#   remove: Xenia patches that don't work on a real console (by name)
+#   then every [[patch]] below is appended to the converted file.
+title_id = "5454082B"
+hash = "1A284CDE0A9F0CF8"
+remove = ["Unlock FPS"]
+
+[[patch]]
+    name = "Disable V-Sync (console)"
+    desc = "Made for a real Xbox 360: turns off v-sync, so the game isn't held at 30 FPS. Expect 30-45 FPS and screen tearing. Use instead of Unlock FPS, which gives a black screen on a console."
+    author = "bobber360 & Claude"
+    is_enabled = false
+
+    [[patch.be8]]
+        address = 0x82c1f5bf
+        value = 0x00
+
+[[patch]]
+    name = "60 FPS V-Sync (console)"
+    desc = "Made for a real Xbox 360: sets the v-sync target from 30 to 60 FPS, no tearing. At native resolution the console often can't hold 60 and drops back to 30. For a steadier 60, combine with a resolution mode or Disable Shadows. Don't combine with Disable V-Sync."
+    author = "bobber360 & Claude"
+    is_enabled = false
+
+    [[patch.be8]]
+        address = 0x82c1f5bf
+        value = 0x01

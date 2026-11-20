@@ -1,0 +1,36 @@
+# XPatch360 converter fix - Batman: Arkham City TU6
+# Applied by Convert-XeniaPatches.ps1 (v1.2) to the Xenia file with this title ID and hash.
+#   remove: Xenia patches that don't work on a real console (by name)
+#   then every [[patch]] below is appended to the converted file.
+title_id = "57520802"
+hash = "DF9C269BB979E4A2"
+remove = ["Unlock FPS"]
+
+[[patch]]
+    name = "60 FPS V-Sync (console)"
+    desc = "Made for a real Xbox 360 (the Xenia Unlock FPS, renamed): removes the engine frame cap and sets the v-sync target from 30 to 60 FPS, no tearing. Where a frame takes longer than 16.7 ms it waits for the next v-sync, so heavy scenes sit at a steady 30. Use only one of the V-Sync patches."
+    author = "Sowa_95, bobber360 & Claude"
+    is_enabled = false
+
+    [[patch.be32]]
+        address = 0x8244e9e4
+        value = 0x60000000 # nop: the engine frame cap (lfs f1) is not loaded
+    [[patch.be8]]
+        address = 0x8224f803
+        value = 0x01 # Present: present interval 2 -> 1 (one v-sync per frame)
+
+[[patch]]
+    name = "Disable V-Sync, 60 FPS cap (console)"
+    desc = "Made for a real Xbox 360: turns off v-sync, so heavy scenes don't step down to 30 FPS, and sets the engine frame cap to 60 FPS (no 500 FPS loading screens). Screen tearing. Use only one of the V-Sync patches."
+    author = "Sowa_95, bobber360 & Claude"
+    is_enabled = false
+
+    [[patch.be32]]
+        address = 0x8244e9d4
+        value = 0xc02a0cec # GetMaxTickRate: default 0.0 (82000A20) -> 60.0 (82000CEC)
+    [[patch.be32]]
+        address = 0x8244e9e4
+        value = 0x60000000 # nop: always the value above (not the game's 30 FPS setting)
+    [[patch.be8]]
+        address = 0x8224f803
+        value = 0x00 # Present: present interval 2 -> 0 (immediate, no v-sync)

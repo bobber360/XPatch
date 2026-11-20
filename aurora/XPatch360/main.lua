@@ -6,7 +6,7 @@
 
 scriptTitle       = "XPatch360"
 scriptAuthor      = "bobber360 & Claude"
-scriptVersion     = 1.1
+scriptVersion     = 1.2
 scriptDescription = "Xenia patches for RGH"
 scriptPermissions = { "filesystem", "content" }
 -- PNG may or may not be accepted by your Aurora version; the official samples
@@ -122,19 +122,33 @@ local function loadToml(path)
     local doc = { path = path, lines = splitLines(data), patches = {}, title = nil }
     local cur = nil
     local inSub = false
+    local curWrite = nil
     for i, l in ipairs(doc.lines) do
         local t = string.match(l.text, "^%s*(.-)%s*$")
         if string.match(t, "^%[%[patch%]%]") then
-            cur = { header = i, enabledLine = nil, on = false, name = "Patch " .. (#doc.patches + 1) }
+            cur = { header = i, enabledLine = nil, on = false, name = "Patch " .. (#doc.patches + 1),
+                    writes = {} }
             table.insert(doc.patches, cur)
             inSub = false
+            curWrite = nil
         elseif string.sub(t, 1, 1) == "[" then
             inSub = true                              -- [[patch.be32]] etc.
+            curWrite = nil
+            local wtype = string.match(t, "^%[%[patch%.([%w_]+)%]%]")
+            if cur ~= nil and wtype ~= nil then
+                curWrite = { type = string.lower(wtype) }
+                table.insert(cur.writes, curWrite)
+            end
         else
             local key, val = string.match(t, "^([%w_]+)%s*=%s*(.-)%s*$")
+            if key ~= nil and curWrite ~= nil and inSub then
+                if key == "address" then curWrite.addr = tonumber(string.match(val, "^0[xX](%x+)") or "", 16)
+                elseif key == "value" then curWrite.value = val end
+            end
             if key ~= nil then
                 if cur == nil then
-                    if key == "title_name" then doc.title = unquote(val) end
+                    if key == "title_name" then doc.title = unquote(val)
+                    elseif key == "title_id" then doc.titleId = string.upper(unquote(val)) end
                 elseif not inSub then
                     if key == "name" then cur.name = unquote(val)
                     elseif key == "author" then cur.author = unquote(val)
@@ -235,9 +249,185 @@ local function consoleDesc(desc)
     return text
 end
 
+
+-- ---------------------------------------------------------------------------
+-- settings (XPatch360.ini, read by the plugin every time a game starts)
+-- ---------------------------------------------------------------------------
+local patchDir = nil          -- folder of the patch files, set in main()
+
+-- plain string (no library call at load time: Aurora reads the script header
+-- before the libraries are there)
+local INI_DEFAULT =
+    "; XPatch360 settings - read at boot and every time a game starts\r\n" ..
+    "; 1 = on, 0 = off. Can also be changed in Aurora: Utilities -> XPatch360 -> Settings\r\n" ..
+    "[XPatch360]\r\n" ..
+    "notify      = 1     ; notification when a game starts\r\n" ..
+    "log         = 1     ; 1 = full log, 0 = errors only\r\n" ..
+    "log_max_kb  = 64    ; a bigger log is deleted at boot and started again\r\n" ..
+    "early_patch = 0     ; patch before the game starts - for patches marked (early patching required)\r\n" ..
+    "debug       = 0     ; debug mode: memory dumps (XPatch360.dump), debug menu in Aurora\r\n"
+
+-- XPatch360's own files live in Hdd:\Patches\XPatch360\ (the plugin creates it)
+local function dataDir()  return patchDir .. "XPatch360\\" end
+local function iniPath()  return dataDir() .. "XPatch360.ini" end
+local function dumpPath() return dataDir() .. "XPatch360.dump" end
+
+local function readIni()
+    local data = FileSystem.ReadFile(iniPath())
+    if data == nil or data == "" then data = INI_DEFAULT end
+    local values = {}
+    for _, l in ipairs(splitLines(data)) do
+        local k, v = string.match(l.text, "^%s*([%w_]+)%s*=%s*([^;%s]*)")
+        if k ~= nil then values[string.lower(k)] = v end
+    end
+    return values, data
+end
+
+local function iniOn(v) return v == "1" or v == "true" or v == "on" end
+
+-- change one value, keeping the spacing and the comment of its line
+local function setIni(key, value)
+    local _, data = readIni()
+    local lines, found = splitLines(data), false
+    for _, l in ipairs(lines) do
+        local pre, old, post = string.match(l.text, "^(%s*" .. key .. "%s*=%s*)([^;%s]*)(.*)$")
+        if pre ~= nil then
+            -- keep the comment column: pad/cut the spaces after the value
+            local pad = string.match(post, "^(%s*)") or ""
+            local rest = string.sub(post, #pad + 1)
+            local width = #old + #pad
+            local spaces = width - #value
+            if spaces < 1 then spaces = (rest ~= "") and 1 or 0 end
+            l.text = pre .. value .. string.rep(" ", spaces) .. rest
+            found = true
+        end
+    end
+    if not found then
+        table.insert(lines, { text = key .. " = " .. value, eol = "\r\n" })
+    end
+    local out = {}
+    for _, l in ipairs(lines) do table.insert(out, l.text); table.insert(out, l.eol) end
+    return FileSystem.WriteFile(iniPath(), table.concat(out))
+end
+
+-- one line in XPatch360.dump (not twice); the plugin removes it after the dump
+local function addDumpLine(line)
+    local data = FileSystem.ReadFile(dumpPath()) or ""
+    for _, l in ipairs(splitLines(data)) do
+        if string.upper(string.match(l.text, "^%s*(.-)%s*$")) == string.upper(line) then return true end
+    end
+    if data ~= "" and not string.find(data, "\n$") then data = data .. "\r\n" end
+    return FileSystem.WriteFile(dumpPath(), data .. line .. "\r\n")
+end
+
+local LOG_SIZES = { 32, 64, 128, 256, 512 }
+
+local function settingsMenu()
+    while true do
+        local v = readIni()
+        local debug = iniOn(v.debug)
+        local logKb = tonumber(v.log_max_kb) or 64
+        local items = {
+            "Notifications: " .. (iniOn(v.notify) and "ON" or "OFF"),
+            "Log: " .. (iniOn(v.log) and "full" or "errors only"),
+            "Log size limit: " .. logKb .. " KB",
+            "Early patching: " .. (iniOn(v.early_patch) and "ON" or "OFF"),
+            "Debug mode: " .. (debug and "ON" or "OFF"),
+        }
+        if debug then table.insert(items, "[ Debug: dump the next game I start ]") end
+
+        local choice = popup(scriptTitle .. " - Settings (from the next game start)", "", items)
+        if choice == nil then return end
+        local ok = true
+        if choice == 1 then ok = setIni("notify", iniOn(v.notify) and "0" or "1")
+        elseif choice == 2 then ok = setIni("log", iniOn(v.log) and "0" or "1")
+        elseif choice == 3 then
+            local nextKb = LOG_SIZES[1]
+            for i, n in ipairs(LOG_SIZES) do
+                if n == logKb then nextKb = LOG_SIZES[i % #LOG_SIZES + 1] end
+            end
+            ok = setIni("log_max_kb", tostring(nextKb))
+        elseif choice == 4 then ok = setIni("early_patch", iniOn(v.early_patch) and "0" or "1")
+        elseif choice == 5 then ok = setIni("debug", debug and "0" or "1")
+        elseif choice == 6 and debug then
+            ok = addDumpLine("next code")
+            if ok then
+                Script.ShowNotification("The next game you start will be dumped", NotificationType.Information)
+            end
+        end
+        if not ok then Script.ShowNotification("Could not save the settings", NotificationType.Error) end
+    end
+end
+
+local function debugOn()
+    local v = readIni()
+    return iniOn(v.debug)
+end
+
+
+-- ---------------------------------------------------------------------------
+-- conflict check: two patches writing the same bytes (only the later one works)
+-- ---------------------------------------------------------------------------
+local TYPE_SIZE = { be8 = 1, be16 = 2, be32 = 4, be64 = 8, f32 = 4, f64 = 8 }
+
+local function writeSize(w)
+    local n = TYPE_SIZE[w.type]
+    if n then return n end
+    local v = w.value or ""
+    if w.type == "string" then return math.max(#unquote(v), 1) end
+    if w.type == "u16string" then return math.max(#unquote(v) * 2, 2) end
+    if w.type == "array" then
+        local hex = string.gsub(string.gsub(unquote(v), "0[xX]", ""), "[^%x]", "")
+        return math.max(math.floor(#hex / 2), 1)
+    end
+    return 4
+end
+
+local function overlaps(a, b)
+    for _, wa in ipairs(a.writes or {}) do
+        if wa.addr then
+            local sa = writeSize(wa)
+            for _, wb in ipairs(b.writes or {}) do
+                if wb.addr and wa.addr < wb.addr + writeSize(wb) and wb.addr < wa.addr + sa then
+                    return true
+                end
+            end
+        end
+    end
+    return false
+end
+
+-- names of the other patches in this file that are ON and write the same bytes
+local function conflictsOf(doc, idx)
+    local list = {}
+    for i, q in ipairs(doc.patches) do
+        if i ~= idx and q.on and overlaps(doc.patches[idx], q) then table.insert(list, q.name) end
+    end
+    return list
+end
+
 -- ---------------------------------------------------------------------------
 -- screens
 -- ---------------------------------------------------------------------------
+-- every patch of the file off, saved once
+local function allOff(doc)
+    local changed = 0
+    for _, p in ipairs(doc.patches) do
+        if p.on and p.enabledLine ~= nil then
+            local l = doc.lines[p.enabledLine]
+            l.text = string.gsub(l.text, "(is_enabled%s*=%s*)%a+", "%1false", 1)
+            changed = changed + 1
+        end
+    end
+    if changed == 0 then return true, 0 end
+    return saveToml(doc), changed
+end
+
+-- "(console)" and "(console, early patching required)" both count
+local function isConsolePatch(p)
+    return string.find(string.lower(p.name), "(console", 1, true) ~= nil
+end
+
 local function editGame(path, fileLabel)
     while true do
         local doc = loadToml(path)              -- reload: line numbers change on insert
@@ -246,31 +436,72 @@ local function editGame(path, fileLabel)
             return
         end
 
-        local items = {}
-        for _, p in ipairs(doc.patches) do
-            table.insert(items, (p.on and "[ON]  " or "[OFF] ") .. p.name)
+        -- entries: special actions first, then the patches; "(console)" patches
+        -- (made for a real Xbox 360) before the Xenia ones
+        local items, actions = {}, {}
+        local function add(text, action) table.insert(items, text); table.insert(actions, action) end
+
+        add("[ Turn all patches off ]", { kind = "alloff" })
+        local titleId = doc.titleId or string.upper(string.match(baseName(path), "^(%x%x%x%x%x%x%x%x)") or "")
+        if titleId ~= "" and debugOn() then
+            add("[ Debug: dump this game's code on next start ]", { kind = "dump" })
+        end
+        for pass = 1, 2 do
+            for i, p in ipairs(doc.patches) do
+                if (pass == 1) == isConsolePatch(p) then
+                    local mark = (p.on and #conflictsOf(doc, i) > 0) and "  (!) conflict" or ""
+                    add((p.on and "[ON]  " or "[OFF] ") .. p.name .. mark, { kind = "patch", index = i })
+                end
+            end
         end
 
         local header = doc.title or baseName(path)
         if fileLabel then header = header .. " - " .. fileLabel end
         local choice = popup(header, "No patches", items)
-        if choice == nil or doc.patches[choice] == nil then return end
+        if choice == nil or actions[choice] == nil then return end
+        local act = actions[choice]
 
-        local p = doc.patches[choice]
-
-        -- info window: author and description, then turn on/off or go back
-        local info = "Author: " .. ((p.author and p.author ~= "") and p.author or "unknown") ..
-                     "\n\n" .. consoleDesc(p.desc)
-        if #info > 700 then info = string.sub(info, 1, 697) .. "..." end
-        local action = p.on and "Turn OFF" or "Turn ON"
-        local ok, ret = pcall(Script.ShowMessageBox, p.name, info, action, "Back")
-
-        if ok and ret ~= nil and not ret.Canceled and ret.Button == 1 then
-            if togglePatch(doc, choice) then
-                Script.ShowNotification(p.name .. (p.on and ": OFF" or ": ON"),
-                                        NotificationType.Information)
-            else
+        if act.kind == "alloff" then
+            local ok, n = allOff(doc)
+            if not ok then
                 Script.ShowNotification("Could not save " .. baseName(path), NotificationType.Error)
+            elseif n == 0 then
+                Script.ShowNotification("All patches are already off", NotificationType.Information)
+            else
+                Script.ShowNotification(n .. " patch" .. (n == 1 and "" or "es") .. " turned off",
+                                        NotificationType.Information)
+            end
+
+        elseif act.kind == "dump" then
+            if addDumpLine(titleId .. " code") then
+                Script.ShowNotification("Code dump at the next start of this game", NotificationType.Information)
+            else
+                Script.ShowNotification("Could not write XPatch360.dump", NotificationType.Error)
+            end
+
+        else
+            local idx = act.index
+            local p = doc.patches[idx]
+
+            -- info window: author and description, then turn on/off or go back
+            local info = "Author: " .. ((p.author and p.author ~= "") and p.author or "unknown") ..
+                         "\n\n" .. consoleDesc(p.desc)
+            local clash = conflictsOf(doc, idx)
+            if #clash > 0 then
+                info = "WARNING: writes the same address as " .. table.concat(clash, ", ") ..
+                       " (ON). Only one of them can work - turn the other one off.\n\n" .. info
+            end
+            if #info > 700 then info = string.sub(info, 1, 697) .. "..." end
+            local action = p.on and "Turn OFF" or "Turn ON"
+            local ok, ret = pcall(Script.ShowMessageBox, p.name, info, action, "Back")
+
+            if ok and ret ~= nil and not ret.Canceled and ret.Button == 1 then
+                if togglePatch(doc, idx) then
+                    Script.ShowNotification(p.name .. (p.on and ": OFF" or ": ON"),
+                                            NotificationType.Information)
+                else
+                    Script.ShowNotification("Could not save " .. baseName(path), NotificationType.Error)
+                end
             end
         end
     end
@@ -285,6 +516,8 @@ function main()
         Script.ShowMessageBox(scriptTitle, msg, "OK")
         return
     end
+
+    patchDir = string.match(files[1], "^(.*\\)") or "Hdd1:\\Patches\\"
 
     -- Group the files by title ID, using only the file names
     -- ("545408A7 - Grand Theft Auto V (TU27).toml"), so hundreds of files
@@ -386,21 +619,23 @@ function main()
             pcall(Script.SetStatus, "Reading game names...")
         end
         resolveNames(list)
-        local items = {}
+        local items = { "[ Settings ]" }
         for _, g in ipairs(list) do
             local count = #g.files
             table.insert(items, g.name .. (count > 1 and ("  (" .. count .. " files)") or ""))
         end
         if not showAll then table.insert(items, "[ Show all games (" .. #groups .. ") ]") end
 
-        local title = scriptTitle .. " v1.1" .. (showAll and " - all games" or " - installed games")
+        local title = scriptTitle .. " v1.2" .. (showAll and " - all games" or " - installed games")
         local choice = popup(title, "No patch files for your installed games", items)
         if choice == nil then
             if showAll and lookupWorks then showAll = false else return end
+        elseif choice == 1 then
+            settingsMenu()
         elseif not showAll and choice == #items then
             showAll = true
-        elseif list[choice] ~= nil then
-            openGame(list[choice])
+        elseif list[choice - 1] ~= nil then
+            openGame(list[choice - 1])
         end
     end
 end

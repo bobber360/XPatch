@@ -1,0 +1,20 @@
+# XPatch360 converter fix - Gears of War 3 TU6
+# Applied by Convert-XeniaPatches.ps1 (v1.2) to the Xenia file with this title ID and hash.
+#   remove: Xenia patches that don't work on a real console (by name)
+#   then every [[patch]] below is appended to the converted file.
+title_id = "4D5308AB"
+hash = "7775898137CE1CE3"
+remove = ["Performance Patch, Option A: Low Settings (No Dynamic Shadows)", "Performance Patch, Option B: Optimized Settings (Smart Shadow Cuts)", "21:9 Aspect Ratio Ultrawide Patch"]
+
+[[patch]]
+    name = "Performance Patch, Option A: Low Settings (console)"
+    desc = "Made for a real Xbox 360: the Xenia Option A crashes on a console when the campaign loads (it writes into the middle of an instruction). Same idea, console-safe: no dynamic shadows and no light environment shadows, less work for the renderer."
+    author = "Sowa_95, bobber360 & Claude"
+    is_enabled = false
+
+    [[patch.be32]]
+        address = 0x827e0a88
+        value = 0x39600000 # li r11,0 (from the Xenia patch: no dynamic shadows)
+    [[patch.be32]]
+        address = 0x8237d038
+        value = 0x48000184 # beq -> b 8237D1BC: skip the light environment shadow (instead of be8 8237D02C = 0)

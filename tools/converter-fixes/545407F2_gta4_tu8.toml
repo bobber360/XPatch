@@ -1,0 +1,287 @@
+# XPatch360 converter fix - Grand Theft Auto IV TU8
+# Applied by Convert-XeniaPatches.ps1 (v1.2) to the Xenia file with this title ID and hash.
+#   remove: Xenia patches that don't work on a real console (by name)
+#   then every [[patch]] below is appended to the converted file.
+title_id = "545407F2"
+hash = "797B4775D3BC9853"
+remove = ["Unlock FPS", "Disable blur filter", "Aspect Ratio"]
+
+[[patch]]
+    name = "Resolution 1120x630 (console, early patching required)"
+    desc = "Made for a real Xbox 360: renders at 1120x630 instead of 1280x720 (close to the PS3 version), the console scales it to the TV output. Fewer GPU dips, sharper than 540p. Needs early patching ON in XPatch360's Settings, otherwise it has no effect. Use only one resolution patch."
+    author = "bobber360 & Claude"
+    is_enabled = false
+
+    [[patch.be32]]
+        address = 0x828c0bec
+        value = 0x39600460 # grcDevice init: width = 1120 (instead of the "width" startup parameter, 1280)
+    [[patch.be32]]
+        address = 0x828c0bf0
+        value = 0x48000018 # b -> store width
+    [[patch.be32]]
+        address = 0x828c0c0c
+        value = 0x39200276 # height = 630 (instead of "height", 720)
+    [[patch.be32]]
+        address = 0x828c0c10
+        value = 0x48000018 # b -> store height
+
+[[patch]]
+    name = "Resolution 960x540 (console, early patching required)"
+    desc = "Made for a real Xbox 360: renders at 960x540 instead of 1280x720, the console scales it to the TV output. The biggest FPS gain (often 40-60 FPS unlocked), but a softer image. Needs early patching ON in XPatch360's Settings, otherwise it has no effect. Use only one resolution patch."
+    author = "bobber360 & Claude"
+    is_enabled = false
+
+    [[patch.be32]]
+        address = 0x828c0bec
+        value = 0x396003c0 # grcDevice init: width = 960
+    [[patch.be32]]
+        address = 0x828c0bf0
+        value = 0x48000018 # b -> store width
+    [[patch.be32]]
+        address = 0x828c0c0c
+        value = 0x3920021c # height = 540
+    [[patch.be32]]
+        address = 0x828c0c10
+        value = 0x48000018 # b -> store height
+
+[[patch]]
+    name = "Locked 30 FPS Frame Pacer (console)"
+    desc = "Made for a real Xbox 360: frames go out at an even 30 FPS (one every 2 v-syncs, 33.4 ms) instead of 25-37 with uneven frame times. Where the game is slower it is not held back further (no drop to 20). Loading screens also run at 30. Don't use with Unlock FPS."
+    author = "bobber360 & Claude"
+    is_enabled = false
+
+    [[patch.be32]]
+        address = 0x828bf43c
+        value = 0x815f2460
+    [[patch.be32]]
+        address = 0x828bf440
+        value = 0x3d000019
+    [[patch.be32]]
+        address = 0x828bf444
+        value = 0x610864a4
+    [[patch.be32]]
+        address = 0x828bf448
+        value = 0x7d6c42e6
+    [[patch.be32]]
+        address = 0x828bf44c
+        value = 0x7d2a5850
+    [[patch.be32]]
+        address = 0x828bf450
+        value = 0x7f094040
+    [[patch.be32]]
+        address = 0x828bf454
+        value = 0x4198fff4
+    [[patch.be32]]
+        address = 0x828bf458
+        value = 0x7d4a4214
+    [[patch.be32]]
+        address = 0x828bf45c
+        value = 0x7d2a5850
+    [[patch.be32]]
+        address = 0x828bf460
+        value = 0x7f094040
+    [[patch.be32]]
+        address = 0x828bf464
+        value = 0x41980008
+    [[patch.be32]]
+        address = 0x828bf468
+        value = 0x7d6a5b78
+    [[patch.be32]]
+        address = 0x828bf46c
+        value = 0x915f2460
+    [[patch.be32]]
+        address = 0x828bf470
+        value = 0x38810050
+    [[patch.be32]]
+        address = 0x828bf474
+        value = 0x807e22a4
+    [[patch.be32]]
+        address = 0x828bf478
+        value = 0x481878f9
+    [[patch.be32]]
+        address = 0x828bf47c
+        value = 0x81610058
+    [[patch.be32]]
+        address = 0x828bf480
+        value = 0x2b0b0002
+    [[patch.be32]]
+        address = 0x828bf484
+        value = 0x4098ffec
+    [[patch.be32]]
+        address = 0x828bf488
+        value = 0x60000000
+
+[[patch]]
+    name = "Traffic & Pedestrian Density 70% (console)"
+    desc = "Made for a real Xbox 360: 30% fewer cars, parked cars and pedestrians (also when missions set the density). Lighter on the CPU; on its own the FPS gain was small in tests."
+    author = "bobber360 & Claude"
+    is_enabled = false
+
+    [[patch.be32]]
+        address = 0x82a87000
+        value = 0x3f333333
+    [[patch.be32]]
+        address = 0x82a87010
+        value = 0x81630008
+    [[patch.be32]]
+        address = 0x82a87014
+        value = 0xc00b0000
+    [[patch.be32]]
+        address = 0x82a87018
+        value = 0x3d6082a8
+    [[patch.be32]]
+        address = 0x82a8701c
+        value = 0xc1ab7000
+    [[patch.be32]]
+        address = 0x82a87020
+        value = 0xec000372
+    [[patch.be32]]
+        address = 0x82a87024
+        value = 0x3d6082aa
+    [[patch.be32]]
+        address = 0x82a87028
+        value = 0xd00b1888
+    [[patch.be32]]
+        address = 0x82a8702c
+        value = 0xd00b188c
+    [[patch.be32]]
+        address = 0x82a87030
+        value = 0x4e800020
+    [[patch.be32]]
+        address = 0x82a87040
+        value = 0x81630008
+    [[patch.be32]]
+        address = 0x82a87044
+        value = 0xc00b0000
+    [[patch.be32]]
+        address = 0x82a87048
+        value = 0x3d6082a8
+    [[patch.be32]]
+        address = 0x82a8704c
+        value = 0xc1ab7000
+    [[patch.be32]]
+        address = 0x82a87050
+        value = 0xec000372
+    [[patch.be32]]
+        address = 0x82a87054
+        value = 0x3d6082aa
+    [[patch.be32]]
+        address = 0x82a87058
+        value = 0xd00b1888
+    [[patch.be32]]
+        address = 0x82a8705c
+        value = 0x4e800020
+    [[patch.be32]]
+        address = 0x82a87070
+        value = 0x81630008
+    [[patch.be32]]
+        address = 0x82a87074
+        value = 0xc00b0000
+    [[patch.be32]]
+        address = 0x82a87078
+        value = 0x3d6082a8
+    [[patch.be32]]
+        address = 0x82a8707c
+        value = 0xc1ab7000
+    [[patch.be32]]
+        address = 0x82a87080
+        value = 0xec000372
+    [[patch.be32]]
+        address = 0x82a87084
+        value = 0x3d6082aa
+    [[patch.be32]]
+        address = 0x82a87088
+        value = 0xd00b188c
+    [[patch.be32]]
+        address = 0x82a8708c
+        value = 0x4e800020
+    [[patch.be32]]
+        address = 0x82a870a0
+        value = 0x3d6082a8
+    [[patch.be32]]
+        address = 0x82a870a4
+        value = 0xc00b7000
+    [[patch.be32]]
+        address = 0x82a870a8
+        value = 0xec210032
+    [[patch.be32]]
+        address = 0x82a870ac
+        value = 0x3d6082aa
+    [[patch.be32]]
+        address = 0x82a870b0
+        value = 0xd02b2940
+    [[patch.be32]]
+        address = 0x82a870b4
+        value = 0x4e800020
+    [[patch.be32]]
+        address = 0x823f2ab0
+        value = 0x486945f0
+    [[patch.be32]]
+        address = 0x82598eb0
+        value = 0x484ee160
+    [[patch.be32]]
+        address = 0x82598ed0
+        value = 0x484ee170
+    [[patch.be32]]
+        address = 0x82598ee8
+        value = 0x484ee188
+    [[patch.be32]]
+        address = 0x82aa1888
+        value = 0x3f333333
+    [[patch.be32]]
+        address = 0x82aa188c
+        value = 0x3f333333
+    [[patch.be32]]
+        address = 0x82aa2940
+        value = 0x3f333333
+    [[patch.be32]]
+        address = 0x823a533c
+        value = 0x3d6082a8
+    [[patch.be32]]
+        address = 0x823a5344
+        value = 0xc00b7000
+    [[patch.be32]]
+        address = 0x823f486c
+        value = 0x3d6082a8
+    [[patch.be32]]
+        address = 0x823f4874
+        value = 0xc00b7000
+
+[[patch]]
+    name = "Cheap Audio Effects (console)"
+    desc = "Made for a real Xbox 360: turns on the game's own hidden -cheapaudioeffects option. Cheaper real-time audio effects and no audio occlusion, so a little less CPU work. Hardly audible."
+    author = "bobber360 & Claude"
+    is_enabled = false
+
+    [[patch.be32]]
+        address = 0x82902ad8
+        value = 0x39600001 # audio init: cheap = 1
+    [[patch.be8]]
+        address = 0x831c6a77
+        value = 0x01 # audio engine (831C6750) +807 = cheap flag, in case init already ran
+
+[[patch]]
+    name = "Disable Depth of Field (console)"
+    desc = "Made for a real Xbox 360: turns off the distance blur (DOF). The Xenia 'Disable blur filter' patch has no effect on a console because the game reads this setting before the patch is applied; this one also writes the value itself."
+    author = "bobber360 & Claude"
+    is_enabled = false
+
+    [[patch.be32]]
+        address = 0x822ce278
+        value = 0x908be904 # stw r4(=0) instead of the DOF multiplier (HD), for later timecycle reloads
+    [[patch.be32]]
+        address = 0x822ce2bc
+        value = 0x908be904 # same (SD)
+    [[patch.be32]]
+        address = 0x82aa9e34
+        value = 0x00000000 # DOF blur multiplier = 0 right away (was 0.5)
+
+[[patch]]
+    name = "Disable Warp Shadow (console)"
+    desc = "Made for a real Xbox 360: skips one of the shadow passes, about +2-3 FPS in the city. Side effect: patchy, stale shadow spots on the ground and on car roofs (most other shadows stay). Best with the Frame Pacer."
+    author = "bobber360 & Claude"
+    is_enabled = false
+
+    [[patch.be32]]
+        address = 0x82524830
+        value = 0x48000d28 # CRenderPhaseWarpShadow: beq -> b (skip building the shadow draw list)
