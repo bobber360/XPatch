@@ -8,7 +8,7 @@ XPatch360 keeps its own files in `Hdd:\Patches\XPatch360\`: the log, the setting
 (`XPatch360.ini`), the hash cache, `XPatch360.dump` and the dumps (`.bin`). The patch files
 (`.toml`) stay in `Hdd:\Patches\`.
 
-1. Aurora → **Utilities → XPatch360 → [ Settings ]** → **Debug mode: ON**.
+1. Aurora → **System → Scripts → XPatch360 → [ Settings ]** → **Debug mode: ON**.
 2. Either
    - open a game's patch list → **[ Debug: dump this game's code on next start ]**, or
    - in Settings → **[ Debug: dump the next game I start ]** (for games that have no patch file yet).

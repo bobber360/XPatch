@@ -1,4 +1,4 @@
--- XPatch360 - patch toggler for Aurora (Utilities menu)
+-- XPatch360 - patch toggler for Aurora (System -> Scripts menu)
 -- Install: copy this folder to  Aurora\User\Scripts\Utility\XPatch360\
 -- Lists the Xenia patch files in Hdd:\Patches\ and flips their
 -- "is_enabled = true/false" lines. The XPatch360 plugin applies the enabled
@@ -259,7 +259,7 @@ local patchDir = nil          -- folder of the patch files, set in main()
 -- before the libraries are there)
 local INI_DEFAULT =
     "; XPatch360 settings - read at boot and every time a game starts\r\n" ..
-    "; 1 = on, 0 = off. Can also be changed in Aurora: Utilities -> XPatch360 -> Settings\r\n" ..
+    "; 1 = on, 0 = off. Can also be changed in Aurora: System -> Scripts -> XPatch360 -> Settings\r\n" ..
     "[XPatch360]\r\n" ..
     "notify      = 1     ; notification when a game starts\r\n" ..
     "log         = 1     ; 1 = full log, 0 = errors only\r\n" ..

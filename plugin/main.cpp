@@ -7,7 +7,7 @@
 // When a title starts (TU already applied by the loader), it computes the same
 // module hash as Xenia Canary and applies every [[patch]] with
 // is_enabled = true, but only from files whose "hash" matches the running game. Toggle them with the Aurora script
-// (Utilities -> XPatch360) or by editing the TOML.
+// (System -> Scripts -> XPatch360) or by editing the TOML.
 //
 // Build: build.bat (Xbox 360 SDK) -> XPatch360.xex
 // Load:  launch.ini ->  pluginN = Hdd:\XPatch360.xex
@@ -100,7 +100,7 @@ static XP_CFG g_Cfg = { TRUE, TRUE, 64, FALSE, FALSE };
 
 static const char g_IniDefault[] =
     "; XPatch360 settings - read at boot and every time a game starts\r\n"
-    "; 1 = on, 0 = off. Can also be changed in Aurora: Utilities -> XPatch360 -> Settings\r\n"
+    "; 1 = on, 0 = off. Can also be changed in Aurora: System -> Scripts -> XPatch360 -> Settings\r\n"
     "[XPatch360]\r\n"
     "notify      = 1     ; notification when a game starts\r\n"
     "log         = 1     ; 1 = full log, 0 = errors only\r\n"

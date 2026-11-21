@@ -25,7 +25,7 @@ depth of field, shadows and more. XPatch360 brings them to real hardware (RGH / 
   console-safe versions of Xenia patches that crash on real hardware (see [Console patches](#console-patches)).
 - **Early patching** (optional): patches go in before the game runs its first instruction, so settings the game
   reads only once at start (like the render resolution) can be changed too.
-- **Aurora script**: *Utilities → XPatch360* lists your installed games, the patch files of each game by TU, and
+- **Aurora script**: *System → Scripts → XPatch360* lists your installed games, the patch files of each game by TU, and
   lets you turn every patch on or off, plus the plugin's settings.
 - **Notification** when the game starts: `XPatch360: 3 patches applied successfully`, `... 1 applied, 1 failed`,
   `... 2 patches skipped - game version doesn't match`, `... - 1 conflict, see log`.
@@ -63,7 +63,7 @@ binary release. Build the plugin yourself first (see [Building the plugin](#buil
    Aurora\User\Scripts\Utility\XPatch360\icon.png
    ```
 4. Restart the console (Dashlaunch loads plugins at boot; Aurora reads scripts when it starts).
-5. In Aurora open **Utilities**, select **XPatch360** and in its details tick the permissions **File system** and
+5. In Aurora open **System → Scripts**, select **XPatch360** and in its details tick the permissions **File system** and
    **Content** (Content is used to list only your installed games).
 6. Check that `Hdd:\Patches\XPatch360\XPatch360.log` exists and starts with `XPatch360 v1.2 started`: the plugin
    is running.
@@ -120,7 +120,7 @@ The Xenia patch files are **not** included here: they belong to their authors in
 
 ## Usage
 
-1. Aurora → **Utilities → XPatch360**.
+1. Aurora → **System → Scripts → XPatch360**.
 2. Pick a game (only installed games are listed; *Show all games* lists everything).
 3. Pick the file that matches the TU you play (`Base game (no TU)`, `TU5`, `TU27`...).
 4. Select a patch: a window shows its author and description, with **Turn ON** / **Turn OFF** and **Back**.
