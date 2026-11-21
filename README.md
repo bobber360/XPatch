@@ -6,9 +6,16 @@
 Xenia patches on real Xbox 360 hardware. Dashlaunch plugin + Aurora menu, works with title updates, no XEX modding.
 </p>
 
-<p align="center"><b>v1.2</b> · <a href="CHANGELOG.md">What's new</a></p>
+<p align="center"><b>v1.2</b> · <a href="CHANGELOG.md">What's new</a> · <a href="https://www.youtube.com/watch?v=pZYefXg7NSg">Video tutorial</a></p>
 
 ---
+
+## Tutorial
+
+<p align="center">
+  <a href="https://www.youtube.com/watch?v=pZYefXg7NSg"><img src="https://img.youtube.com/vi/pZYefXg7NSg/maxresdefault.jpg" width="80%" alt="XPatch360 v1.2 video tutorial on YouTube"></a>
+</p>
+<p align="center"><sub>Build, install and a test on GTA IV with early patching (click to watch on YouTube).</sub></p>
 
 ## What it does
 
